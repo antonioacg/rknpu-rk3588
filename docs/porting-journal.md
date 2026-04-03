@@ -158,12 +158,19 @@ On mainline with w568w's port, the governor will be `simple_ondemand` (standard 
 
 ### SCMI firmware
 
-**`/sys/firmware/scmi_dev/` does NOT exist** on this BSP kernel. However, SCMI clocks clearly work
-(devfreq reports frequencies, and the `scmi_clk` DT symbol resolves to `/firmware/scmi/protocol@14`).
-The BSP kernel's SCMI implementation may not expose the sysfs interface.
+`/sys/firmware/scmi_dev/` does not exist (BSP lacks `CONFIG_ARM_SCMI_POWER_CONTROL`), but SCMI
+clocks are fully functional. Verified via clock debugfs:
 
-On mainline 6.19+, `CONFIG_ARM_SCMI_PROTOCOL` should expose this interface. Verify after booting
-Armbian edge.
+```
+scmi_clk_npu                  200 MHz  (SCMI-managed, initial rate)
+  └─ aclk_npu0/1/2            250 MHz  (CRU-derived AXI clocks)
+  └─ hclk_npu0/1/2            198 MHz  (CRU-derived AHB clocks)
+  └─ pclk_npu_root            100 MHz  (CRU-derived APB clock)
+```
+
+All 8 clocks referenced in our overlay are present and active. The SCMI tracing interface exists
+at `/sys/kernel/tracing/events/scmi/` (fc_call, xfer_begin, xfer_end). On mainline 6.19+, verify
+clocks with: `sudo cat /sys/kernel/debug/clk/clk_summary | grep -i npu`
 
 ### CMA memory
 
