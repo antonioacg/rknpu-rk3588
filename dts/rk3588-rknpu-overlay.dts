@@ -1,0 +1,215 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Device Tree Overlay for RK3588/RK3588S RKNPU (vendor driver)
+ *
+ * STATUS: UNTESTED — first draft based on vendor kernel sources.
+ * Hardware testing on RK3588 has not been performed yet.
+ *
+ * This overlay adds the NPU device tree node required by the out-of-tree
+ * RKNPU kernel module (rknpu.ko from w568w/rknpu-module). It is designed
+ * for mainline Linux 6.19+ where the NPU node is not present in the DTB.
+ *
+ * Reference sources:
+ *   - rockchip-linux/kernel develop-5.10: arch/arm64/boot/dts/rockchip/rk3588s.dtsi
+ *   - rockchip-linux/kernel develop-6.6: arch/arm64/boot/dts/rockchip/rk3588s.dtsi
+ *   - Mainline kernel rk3588s.dtsi (confirms MMIO addresses independently)
+ *
+ * Requirements:
+ *   - Target DTB must be compiled with -@ (symbols) for phandle resolution
+ *   - SCMI firmware must be running (provides SCMI_CLK_NPU)
+ *   - Power domains (NPUTOP, NPU1, NPU2) must be available
+ *
+ * Hardware: RK3588 NPU — 3 cores, 6 TOPS total, 40-bit DMA
+ */
+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/clock/rockchip,rk3588-cru.h>
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/power/rk3588-power.h>
+#include <dt-bindings/reset/rockchip,rk3588-cru.h>
+
+/*
+ * SCMI clock ID for the NPU — not in mainline dt-bindings headers.
+ * Value 6 comes from the vendor kernel's scmi_clock table.
+ * If your kernel has dt-bindings/clock/rockchip,rk3588-scmi.h, use that instead.
+ */
+#ifndef SCMI_CLK_NPU
+#define SCMI_CLK_NPU 6
+#endif
+
+/* ----------------------------------------------------------------
+ * Fragment 0: OPP table for NPU devfreq
+ *
+ * Frequencies and voltages from vendor rk3588s.dtsi.
+ * The driver uses this table for dynamic frequency scaling.
+ * ---------------------------------------------------------------- */
+&{/} {
+	npu_opp_table: npu-opp-table {
+		compatible = "operating-points-v2";
+
+		opp-300000000 {
+			opp-hz = /bits/ 64 <300000000>;
+			opp-microvolt = <675000 675000 850000>;
+		};
+		opp-400000000 {
+			opp-hz = /bits/ 64 <400000000>;
+			opp-microvolt = <675000 675000 850000>;
+		};
+		opp-500000000 {
+			opp-hz = /bits/ 64 <500000000>;
+			opp-microvolt = <675000 675000 850000>;
+		};
+		opp-600000000 {
+			opp-hz = /bits/ 64 <600000000>;
+			opp-microvolt = <675000 675000 850000>;
+		};
+		opp-700000000 {
+			opp-hz = /bits/ 64 <700000000>;
+			opp-microvolt = <700000 700000 850000>;
+		};
+		opp-800000000 {
+			opp-hz = /bits/ 64 <800000000>;
+			opp-microvolt = <750000 750000 850000>;
+		};
+		opp-900000000 {
+			opp-hz = /bits/ 64 <900000000>;
+			opp-microvolt = <800000 800000 850000>;
+		};
+		opp-1000000000 {
+			opp-hz = /bits/ 64 <1000000000>;
+			opp-microvolt = <850000 850000 1000000>;
+		};
+	};
+};
+
+/* ----------------------------------------------------------------
+ * Fragment 1: NPU node
+ *
+ * Three NPU cores at:
+ *   Core 0: 0xfdab0000 (64KB)
+ *   Core 1: 0xfdac0000 (64KB)
+ *   Core 2: 0xfdad0000 (64KB)
+ *
+ * Each core has its own IRQ, clock, reset, and power domain.
+ * The driver probes all three and falls back to fewer if unavailable.
+ * ---------------------------------------------------------------- */
+&{/} {
+	npu: npu@fdab0000 {
+		compatible = "rockchip,rk3588-rknpu";
+
+		/* MMIO register regions — one per core */
+		reg = <0x0 0xfdab0000 0x0 0x10000>,  /* Core 0 */
+		      <0x0 0xfdac0000 0x0 0x10000>,  /* Core 1 */
+		      <0x0 0xfdad0000 0x0 0x10000>;  /* Core 2 */
+
+		/* GIC SPI interrupts — one per core, all level-high */
+		interrupts = <GIC_SPI 110 IRQ_TYPE_LEVEL_HIGH>,  /* npu0_irq */
+		             <GIC_SPI 111 IRQ_TYPE_LEVEL_HIGH>,  /* npu1_irq */
+		             <GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH>;  /* npu2_irq */
+		interrupt-names = "npu0_irq", "npu1_irq", "npu2_irq";
+
+		/*
+		 * Clocks:
+		 *   clk_npu  — main NPU clock from SCMI (System Control Processor)
+		 *   aclk0/1/2 — AXI clocks for each core (from CRU)
+		 *   hclk0/1/2 — AHB clocks for each core (from CRU)
+		 *   pclk     — APB clock for NPU root (from CRU)
+		 *
+		 * The SCMI clock (clk_npu) is managed by firmware, not the kernel
+		 * clock framework directly. The scmi_clk phandle must exist in the DTB.
+		 */
+		clocks = <&scmi_clk SCMI_CLK_NPU>,
+		         <&cru ACLK_NPU0>,
+		         <&cru ACLK_NPU1>,
+		         <&cru ACLK_NPU2>,
+		         <&cru HCLK_NPU0>,
+		         <&cru HCLK_NPU1>,
+		         <&cru HCLK_NPU2>,
+		         <&cru PCLK_NPU_ROOT>;
+		clock-names = "clk_npu", "aclk0", "aclk1", "aclk2",
+		              "hclk0", "hclk1", "hclk2", "pclk";
+
+		/*
+		 * Resets — AXI and AHB resets for each core.
+		 * Used during driver probe and power management.
+		 */
+		resets = <&cru SRST_A_RKNN0>,
+		         <&cru SRST_A_RKNN1>,
+		         <&cru SRST_A_RKNN2>,
+		         <&cru SRST_H_RKNN0>,
+		         <&cru SRST_H_RKNN1>,
+		         <&cru SRST_H_RKNN2>;
+		reset-names = "srst_a0", "srst_a1", "srst_a2",
+		              "srst_h0", "srst_h1", "srst_h2";
+
+		/*
+		 * Power domains — one per core.
+		 * NPUTOP must be on for any core to work.
+		 * NPU1/NPU2 are independent and can be powered down individually.
+		 * The driver attaches virtual devices to each power domain.
+		 */
+		power-domains = <&power RK3588_PD_NPUTOP>,
+		                <&power RK3588_PD_NPU1>,
+		                <&power RK3588_PD_NPU2>;
+		power-domain-names = "npu0", "npu1", "npu2";
+
+		/*
+		 * IOMMU — disabled by default due to known IOMMU v2 bugs.
+		 * See CLAUDE.md "Known Issues" for details.
+		 * When enabled, the NPU uses the IOMMU for DMA address translation.
+		 */
+		iommus = <&rknpu_mmu>;
+
+		/* OPP table for dynamic frequency scaling */
+		operating-points-v2 = <&npu_opp_table>;
+
+		status = "okay";
+	};
+};
+
+/* ----------------------------------------------------------------
+ * Fragment 2: IOMMU for NPU
+ *
+ * The RK3588 NPU IOMMU has 4 register regions:
+ *   0xfdab9000 — Core 0, region A
+ *   0xfdaba000 — Core 0, region B
+ *   0xfdaca000 — Core 1
+ *   0xfdada000 — Core 2
+ *
+ * IMPORTANT: Disabled by default.
+ * w568w found that mainline rockchip-iommu.c doesn't constrain page
+ * table allocations to DMA32 zone. On systems with >4GB RAM, page
+ * tables may be allocated above 4GB, causing bus errors. The RK3588
+ * uses IOMMU v2 which may have different behavior — test before enabling.
+ *
+ * To enable: change status to "okay" and test thoroughly.
+ * ---------------------------------------------------------------- */
+&{/} {
+	rknpu_mmu: iommu@fdab9000 {
+		compatible = "rockchip,iommu-v2";
+
+		reg = <0x0 0xfdab9000 0x0 0x100>,  /* Core 0, region A */
+		      <0x0 0xfdaba000 0x0 0x100>,  /* Core 0, region B */
+		      <0x0 0xfdaca000 0x0 0x100>,  /* Core 1 */
+		      <0x0 0xfdada000 0x0 0x100>;  /* Core 2 */
+
+		interrupts = <GIC_SPI 110 IRQ_TYPE_LEVEL_HIGH>,
+		             <GIC_SPI 111 IRQ_TYPE_LEVEL_HIGH>,
+		             <GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH>;
+
+		clocks = <&cru ACLK_NPU0>,
+		         <&cru ACLK_NPU1>,
+		         <&cru ACLK_NPU2>,
+		         <&cru HCLK_NPU0>,
+		         <&cru HCLK_NPU1>,
+		         <&cru HCLK_NPU2>;
+
+		#iommu-cells = <0>;
+
+		/* Disabled by default — see comment above */
+		status = "disabled";
+	};
+};

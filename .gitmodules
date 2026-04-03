@@ -1,0 +1,15 @@
+[submodule "ref/rknpu-module"]
+	path = ref/rknpu-module
+	url = https://github.com/w568w/rknpu-module.git
+[submodule "ref/rknn-llm"]
+	path = ref/rknn-llm
+	url = https://github.com/airockchip/rknn-llm.git
+[submodule "ref/rknpu-device-plugin"]
+	path = ref/rknpu-device-plugin
+	url = https://github.com/elct9620/rknpu-device-plugin.git
+[submodule "ref/rknpu-driver-dkms"]
+	path = ref/rknpu-driver-dkms
+	url = https://github.com/bmilde/rknpu-driver-dkms.git
+[submodule "ref/radxa-overlays"]
+	path = ref/radxa-overlays
+	url = https://github.com/radxa-pkg/radxa-overlays.git
