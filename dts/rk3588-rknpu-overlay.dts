@@ -113,13 +113,17 @@
 
 		/*
 		 * Clocks:
-		 *   clk_npu  — main NPU clock from SCMI (System Control Processor)
+		 *   scmi_clk — main NPU clock from SCMI (System Control Processor)
+		 *              Named "scmi_clk" to match w568w's devfreq code which calls
+		 *              devm_pm_opp_set_clkname(dev, "scmi_clk"). The vendor DTS
+		 *              uses "clk_npu" but the vendor driver uses a private API
+		 *              (rockchip_init_opp_table) that was replaced in the port.
 		 *   aclk0/1/2 — AXI clocks for each core (from CRU)
 		 *   hclk0/1/2 — AHB clocks for each core (from CRU)
 		 *   pclk     — APB clock for NPU root (from CRU)
 		 *
-		 * The SCMI clock (clk_npu) is managed by firmware, not the kernel
-		 * clock framework directly. The scmi_clk phandle must exist in the DTB.
+		 * The SCMI clock is managed by firmware, not the kernel clock framework
+		 * directly. The scmi_clk phandle must exist in the DTB.
 		 */
 		clocks = <&scmi_clk SCMI_CLK_NPU>,
 		         <&cru ACLK_NPU0>,
@@ -129,7 +133,7 @@
 		         <&cru HCLK_NPU1>,
 		         <&cru HCLK_NPU2>,
 		         <&cru PCLK_NPU_ROOT>;
-		clock-names = "clk_npu", "aclk0", "aclk1", "aclk2",
+		clock-names = "scmi_clk", "aclk0", "aclk1", "aclk2",
 		              "hclk0", "hclk1", "hclk2", "pclk";
 
 		/*
@@ -185,11 +189,14 @@
  * tables may be allocated above 4GB, causing bus errors. The RK3588
  * uses IOMMU v2 which may have different behavior — test before enabling.
  *
+ * Compatible string: mainline rockchip-iommu.c probes for
+ * "rockchip,rk3568-iommu", NOT the vendor "rockchip,iommu-v2".
+ *
  * To enable: change status to "okay" and test thoroughly.
  * ---------------------------------------------------------------- */
 &{/} {
 	rknpu_mmu: iommu@fdab9000 {
-		compatible = "rockchip,iommu-v2";
+		compatible = "rockchip,rk3568-iommu";
 
 		reg = <0x0 0xfdab9000 0x0 0x100>,  /* Core 0, region A */
 		      <0x0 0xfdaba000 0x0 0x100>,  /* Core 0, region B */
@@ -199,6 +206,7 @@
 		interrupts = <GIC_SPI 110 IRQ_TYPE_LEVEL_HIGH>,
 		             <GIC_SPI 111 IRQ_TYPE_LEVEL_HIGH>,
 		             <GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "npu0_mmu", "npu1_mmu", "npu2_mmu";
 
 		clocks = <&cru ACLK_NPU0>,
 		         <&cru ACLK_NPU1>,
@@ -206,6 +214,8 @@
 		         <&cru HCLK_NPU0>,
 		         <&cru HCLK_NPU1>,
 		         <&cru HCLK_NPU2>;
+		clock-names = "aclk0", "aclk1", "aclk2",
+		              "iface0", "iface1", "iface2";
 
 		#iommu-cells = <0>;
 
