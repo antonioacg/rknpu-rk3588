@@ -15,3 +15,6 @@ modules.order
 
 # Staging tree assembled by scripts/build-module.sh (submodule + patches)
 /build/
+
+# Per-machine notes (paths to sibling repos, lab credentials, etc.)
+CLAUDE.local.md

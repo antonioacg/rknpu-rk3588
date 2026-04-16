@@ -4,7 +4,7 @@ Out-of-tree RKNPU kernel module for RK3588/RK3588S on mainline Linux 6.19+. Enab
 
 ## Status
 
-**Work in progress.** The RK3588 device tree overlay is a first draft based on vendor kernel sources. Hardware testing on RK3588 has not been performed yet. The underlying driver code (from w568w/rknpu-module) has been proven on RK3566 with kernel 6.19.3.
+**Working on RK3588S.** Validated end-to-end on Armbian 6.18.22 (Orange Pi 5 Pro): DKMS-installed module auto-loads on boot, `/dev/dri/renderD129` appears, vendor RKNN SDK 2.3.2 drives real MobileNet inference at 123 inf/s single-core and 271 inf/s across all three cores. See [docs/porting-journal.md](docs/porting-journal.md) for the full write-up including the IRQ-cells blocker and its resolution. Pre-upstream security/memory audit tracked in [issue #2](https://github.com/antonioacg/rknpu-rk3588/issues/2).
 
 ## Why This Exists
 
@@ -22,6 +22,28 @@ Two mutually exclusive NPU stacks exist for RK3588:
 | **Mainline Rocket** | `accel/rocket` (in-tree) | Mesa Teflon, TFLite | .tflite only | 6.18+ |
 
 This project enables the **vendor RKNN stack** on modern kernels. It does not replace or compete with the Rocket driver.
+
+## Scope and Related Repos
+
+This repo is deliberately narrow: **driver + device-tree overlay + DKMS install + docs**. Everything else lives elsewhere.
+
+### In scope
+- RK3588 DT overlay (`dts/rk3588-rknpu-overlay.dts`)
+- DKMS packaging (`scripts/install-dkms.sh`)
+- Local patches to the vendor driver carried in `patches/` until upstreamed
+- Inference smoke test that proves the vendor SDK works against this port
+- Engineering journal + hardware reference
+
+### Out of scope — lives in other repos
+- **Model conversion** (HuggingFace → `.rkllm` via rkllm-toolkit): planned `gemma-rk3588` repo
+- **LLM serving** (rkllama, systemd units, Ollama-style HTTP front-end): planned `gemma-rk3588` repo
+- **Kubernetes device plugin** integration: [elct9620/rknpu-device-plugin](https://github.com/elct9620/rknpu-device-plugin) (reference-submoduled only)
+- **LXC / Incus / unprivileged container access**: downstream platform concern, not this repo
+
+### Upstream and downstream
+
+- **Upstream:** [w568w/rknpu-module](https://github.com/w568w/rknpu-module) — tracked as submodule at `ref/rknpu-module/`. Our `patches/0001-devfreq-governor-conditional.patch` is a candidate for upstreaming once the [pre-upstream review](https://github.com/antonioacg/rknpu-rk3588/issues/2) is done.
+- **Downstream:** consumers of `/dev/dri/renderD129` — any project using librknnrt or librkllmrt against a modern kernel. The planned `gemma-rk3588` repo will be the first such consumer; others can bring their own.
 
 ## Hardware
 

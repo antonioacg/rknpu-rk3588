@@ -145,8 +145,10 @@ Conventional commits: `feat:`, `fix:`, `docs:`, `chore:`. Reference upstream sou
 
 ## What NOT to Do
 
-- Do NOT modify w568w's code in the submodule — fork upstream if needed
+- Do NOT modify w568w's code in the submodule — carry changes as `patches/*.patch` that `scripts/build-module.sh` and `scripts/install-dkms.sh` apply to a staged copy
 - Do NOT add the full Linux kernel as a submodule (multi-GB)
 - Do NOT use GPL-2.0-or-later — must be GPL-2.0-only
 - Do NOT vendor Rockchip binary blobs — reference submodule paths
 - Do NOT assume IOMMU works on RK3588 — start disabled, test incrementally
+- Do NOT expand scope into model conversion, LLM serving (rkllama), K8s device plugin wiring, or LXC/Incus container access. Those are downstream concerns that belong in sibling repos (the planned `gemma-rk3588` is the first). When the user asks for LLM work, the answer is "that goes in gemma-rk3588, not here." See [README.md#scope-and-related-repos](README.md#scope-and-related-repos).
+- Do NOT touch devfreq userspace writes (`governor`, `min_freq`, `max_freq`, `set_freq`) — observed to hang the board hard (physical power-cycle required). Passive reads are safe. See porting journal "Known issue: devfreq userspace governor hangs the board".
