@@ -1,0 +1,14 @@
+# SD card backup images (large binaries, not for version control)
+sd-backup-*.img
+sd-backup-*.img.gz
+sd-backup-*.img.xz
+
+# Build artifacts from the DKMS module (ref/rknpu-module is a submodule)
+*.ko
+*.o
+*.mod
+*.mod.c
+*.cmd
+Module.symvers
+modules.order
+.tmp_versions/
