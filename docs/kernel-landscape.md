@@ -59,6 +59,8 @@ Users who want TFLite via Rocket instead of RKNN don't install this repo
 ## Key Resources
 
 - [w568w/rknpu-module](https://github.com/w568w/rknpu-module) -- Proved the DKMS approach on RK3566 + kernel 6.19.3. We carry one patch against it (`patches/0001-devfreq-governor-conditional.patch`) to handle `<linux/devfreq-governor.h>` becoming private in 6.16+; candidate for upstreaming once the [pre-upstream audit](https://github.com/antonioacg/rknpu-rk3588/issues/2) is complete.
+- [schwankner/talos-rk3588-npu](https://github.com/schwankner/talos-rk3588-npu) -- Wraps the same `w568w/rknpu-module` source as a Talos System Extension + Kubernetes CDI device plugin for unprivileged NPU pods. Parallel packaging effort for the immutable / k8s-native substrate. See [docs/talos-packaging.md](talos-packaging.md).
+- [milas/talos-sbc-rk3588](https://github.com/milas/talos-sbc-rk3588) -- Talos installer images for RK3588 boards (Radxa Rock 5A/5B today). Upstream of the installer side of schwankner's stack.
 - [airockchip/rknn-toolkit2](https://github.com/airockchip/rknn-toolkit2) -- Official RKNN runtime (`librknnrt.so`) + SDK + sample models. `scripts/test-inference.sh` fetches `librknnrt.so` and `mobilenet_v1.rknn` from this repo on demand.
 - [airockchip/rknn-llm](https://github.com/airockchip/rknn-llm) -- Official RKNN-LLM runtime (`librkllmrt.so`) and rkllm-toolkit. Downstream consumers targeting on-device LLM inference depend on this; see the planned `gemma-rk3588` repo.
 - [rockchip-linux/kernel](https://github.com/rockchip-linux/kernel) -- Vendor BSP kernel source (branches: develop-5.10, develop-6.1, develop-6.6). Authoritative `rk3588s.dtsi`.

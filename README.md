@@ -43,7 +43,8 @@ This repo is deliberately narrow: **driver + device-tree overlay + DKMS install 
 ### Upstream and downstream
 
 - **Upstream:** [w568w/rknpu-module](https://github.com/w568w/rknpu-module) — tracked as submodule at `ref/rknpu-module/`. Our `patches/0001-devfreq-governor-conditional.patch` is a candidate for upstreaming once the [pre-upstream review](https://github.com/antonioacg/rknpu-rk3588/issues/2) is done.
-- **Downstream:** consumers of `/dev/dri/renderD129` — any project using librknnrt or librkllmrt against a modern kernel. The planned `gemma-rk3588` repo will be the first such consumer; others can bring their own.
+- **Downstream (userspace):** consumers of `/dev/dri/renderD129` — any project using librknnrt or librkllmrt against a modern kernel. The planned `gemma-rk3588` repo will be the first such consumer; others can bring their own.
+- **Sibling packaging (Talos Linux):** [schwankner/talos-rk3588-npu](https://github.com/schwankner/talos-rk3588-npu) wraps the same `w568w/rknpu-module` 0.9.8 source as a Talos System Extension + Kubernetes CDI device plugin. Driver-level fixes here (e.g. 4-cell GIC interrupts, `rknpu-supply` wiring, devfreq patch) likely apply there too. See [docs/talos-packaging.md](docs/talos-packaging.md) for the relationship.
 
 ## Hardware
 
