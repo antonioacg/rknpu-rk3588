@@ -12,3 +12,6 @@ sd-backup-*.img.xz
 Module.symvers
 modules.order
 .tmp_versions/
+
+# Staging tree assembled by scripts/build-module.sh (submodule + patches)
+/build/
