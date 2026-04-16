@@ -51,36 +51,61 @@ This repo is deliberately narrow: **driver + device-tree overlay + DKMS install 
 - **Tested board**: Orange Pi 5 Pro (RK3588S)
 - **NPU**: 3 cores, 6 TOPS total
 - **Device node**: `/dev/dri/renderD129`
-- **Kernel**: 6.19+ (Armbian edge)
+- **Tested kernel**: Armbian `6.18.22-current-rockchip64` (any 6.18+ with SCMI + GIC-v3 should work)
 
 ## Quick Start
 
-```bash
-# Prerequisites
-apt install linux-headers-$(uname -r) build-essential device-tree-compiler dkms
+All three scripts are idempotent and safe to re-run.
 
-# Clone with submodules
+```bash
+# 1. Install prerequisites (on the board)
+sudo apt install linux-headers-$(uname -r) build-essential \
+                 device-tree-compiler dkms patch
+
+# 2. Clone with submodules
 git clone --recurse-submodules https://github.com/antonioacg/rknpu-rk3588.git
 cd rknpu-rk3588
 
-# Build module (uses w568w's Makefile)
-cd ref/rknpu-module && make KDIR=/lib/modules/$(uname -r)/build
-cd ../..
+# 3. Merge the NPU overlay into the board DTB (offline, survives reboot)
+sudo ./scripts/apply-overlay.sh
 
-# Compile DT overlay
-dtc -@ -I dts -O dtb -o rk3588-rknpu.dtbo dts/rk3588-rknpu-overlay.dts
+# 4. Install the module via DKMS (auto-rebuilds on kernel upgrades)
+sudo ./scripts/install-dkms.sh
+echo rknpu | sudo tee /etc/modules-load.d/rknpu.conf  # auto-load at boot
 
-# Load overlay (requires root)
-sudo mkdir -p /sys/kernel/config/device-tree/overlays/rknpu
-sudo cat rk3588-rknpu.dtbo > /sys/kernel/config/device-tree/overlays/rknpu/dtbo
+# 5. Reboot so the new DTB is loaded by U-Boot
+sudo reboot
 
-# Load module
-sudo modprobe rknpu  # or: sudo insmod ref/rknpu-module/rknpu.ko
+# --- after reboot ---
 
-# Verify
-ls /dev/dri/renderD*
-cat /sys/module/rknpu/version  # should show 0.9.8
+# 6. Verify the module is live
+cat /sys/module/rknpu/version          # -> 0.9.8
+ls /dev/dri/renderD129                 # -> exists
+
+# 7. (Optional) End-to-end inference smoke test against the vendor RKNN SDK
+#    Downloads librknnrt.so + mobilenet_v1.rknn from airockchip/rknn-toolkit2,
+#    compiles tests/rknn_smoke.c, runs 200 iterations, reports throughput.
+sudo ./scripts/test-inference.sh
 ```
+
+Expected smoke-test output on an Orange Pi 5 Pro @ 6.18.22:
+
+```
+SDK api=2.3.2 driver=0.9.8
+core_mask=auto   iters=200   8.11 ms/inf   123.3 inf/s
+```
+
+With `CORE_MASK=0_1_2` you get ~271 inf/s across all three cores.
+
+### Live NPU monitoring
+
+```bash
+sudo watch -n 0.5 ./scripts/watch-npu.sh
+```
+
+Shows `freq`, `volt`, `power`, per-core `load`, and per-IRQ counters
+updating at 2 Hz — useful for confirming a workload is actually hitting
+the NPU.
 
 ## Repository Structure
 
@@ -91,22 +116,31 @@ rknpu-rk3588/
 ├── CLAUDE.md                        # AI assistant instructions
 ├── CONTRIBUTING.md                  # Contribution guidelines
 ├── dts/
-│   └── rk3588-rknpu-overlay.dts    # RK3588 NPU device tree overlay (UNTESTED)
+│   └── rk3588-rknpu-overlay.dts    # RK3588 NPU device tree overlay
+├── patches/
+│   └── 0001-devfreq-governor-conditional.patch
+│                                    # Applied to ref/rknpu-module at build time
+│                                    # (candidate for upstream to w568w)
+├── tests/
+│   └── rknn_smoke.c                 # Minimal C inference test (libc + librknnrt)
 ├── docs/
 │   ├── hardware-reference.md       # MMIO addresses, IRQs, clocks, power domains
 │   ├── kernel-landscape.md         # Comparison of kernel options for RK3588 NPU
-│   ├── porting-journal.md          # Engineering log
+│   ├── porting-journal.md          # Engineering log (including IRQ blocker resolution)
 │   └── testing.md                  # Test procedures and results
 ├── scripts/
-│   ├── build-module.sh             # Build helper
-│   ├── install-dkms.sh             # DKMS install helper
+│   ├── apply-overlay.sh            # Offline DTB merge: cpp + dtc + fdtoverlay
+│   ├── build-module.sh             # Stage submodule + apply patches + make
+│   ├── install-dkms.sh             # DKMS install against staged+patched tree
 │   ├── check-hardware.sh           # Verify RK3588 NPU hardware presence
-│   └── test-rknn.sh               # Smoke test with librknnrt
-├── ref/                            # Git submodules
-│   ├── rknpu-module/               # w568w/rknpu-module
+│   ├── test-rknn.sh                # Passive DRM/debugfs/IRQ smoke test
+│   ├── test-inference.sh           # End-to-end inference test (fetches vendor SDK)
+│   └── watch-npu.sh                # One-shot NPU activity snapshot (for watch(1))
+├── ref/                            # Git submodules (read-only references)
+│   ├── rknpu-module/               # w568w/rknpu-module (base DKMS module)
 │   ├── rknn-llm/                   # airockchip/rknn-llm
-│   ├── rknpu-device-plugin/        # elct9620/rknpu-device-plugin
-│   ├── rknpu-driver-dkms/          # bmilde/rknpu-driver-dkms
+│   ├── rknpu-device-plugin/        # elct9620/rknpu-device-plugin (reference only)
+│   ├── rknpu-driver-dkms/          # bmilde/rknpu-driver-dkms (failed, reference)
 │   └── radxa-overlays/             # radxa-pkg/radxa-overlays
 └── .github/
     └── workflows/
@@ -130,8 +164,9 @@ rknpu-rk3588/
 | RKNPU driver | 0.9.8 | rockchip-linux/kernel develop-6.6 (via w568w port) |
 | librknnrt | 2.3.2 | airockchip/rknn-llm |
 | rkllm-runtime | 1.2.3 | airockchip/rknn-llm |
-| Target kernel | 6.19+ | Armbian edge / mainline |
-| Tested kernel | 6.19.3-edge-rockchip64 | Armbian (w568w, RK3566 only) |
+| Target kernel | 6.18+ | Armbian current / mainline |
+| Tested kernel | 6.18.22-current-rockchip64 | Armbian (RK3588S, this project) |
+| Upstream driver tested | 6.19.3-edge-rockchip64 | Armbian (w568w, RK3566 only) |
 
 ## Related Projects
 

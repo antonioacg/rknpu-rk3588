@@ -6,34 +6,14 @@ Out-of-tree RKNPU kernel module for RK3588/RK3588S on mainline Linux 6.19+. Enab
 
 ## Repository Layout
 
-```
-rknpu-rk3588/
-├── LICENSE                          # GPL-2.0-only
-├── README.md                        # Human-readable project overview
-├── CLAUDE.md                        # This file — AI assistant instructions
-├── CONTRIBUTING.md                  # Contribution guidelines (GPL-2.0-only, DCO)
-├── dts/
-│   └── rk3588-rknpu-overlay.dts    # THE MAIN DELIVERABLE — RK3588 NPU DT overlay
-├── docs/
-│   ├── hardware-reference.md       # All MMIO addresses, IRQs, clocks, power domains
-│   ├── kernel-landscape.md         # Comparison of all kernel options for RK3588 NPU
-│   ├── porting-journal.md          # Engineering log
-│   └── testing.md                  # Test procedures and results
-├── scripts/
-│   ├── build-module.sh             # Build helper (wraps w568w's Makefile)
-│   ├── install-dkms.sh             # DKMS install helper
-│   ├── check-hardware.sh           # Verify RK3588 NPU hardware is present
-│   └── test-rknn.sh               # Smoke test with librknnrt
-├── ref/                            # Git submodules — reference implementations
-│   ├── rknpu-module/               # w568w/rknpu-module (base DKMS module)
-│   ├── rknn-llm/                   # airockchip/rknn-llm (runtime libs + vendor driver)
-│   ├── rknpu-device-plugin/        # elct9620/rknpu-device-plugin (K8s integration)
-│   ├── rknpu-driver-dkms/          # bmilde/rknpu-driver-dkms (failed attempt — reference)
-│   └── radxa-overlays/             # radxa-pkg/radxa-overlays (DT overlay patterns)
-└── .github/
-    └── workflows/
-        └── build.yml               # CI: compile module + DT overlay (ARM64 cross-compile)
-```
+See [README.md § Repository Structure](README.md#repository-structure) for the canonical tree. Key paths:
+
+- `dts/rk3588-rknpu-overlay.dts` — the main deliverable (DT overlay)
+- `patches/*.patch` — carry changes applied to `ref/rknpu-module` at build time. Never edit the submodule itself.
+- `tests/rknn_smoke.c` — minimal inference test used by `scripts/test-inference.sh`
+- `scripts/{apply-overlay,build-module,install-dkms,test-inference,watch-npu}.sh` — the operational surface
+- `ref/rknpu-module` — w568w's DKMS module, treated as read-only upstream
+- `build/` — gitignored; `scripts/build-module.sh` stages the submodule here and applies patches. Safe to `rm -rf`.
 
 ## The Main Deliverable: `dts/rk3588-rknpu-overlay.dts`
 
@@ -122,21 +102,23 @@ rg "rknpu\|npu" ref/radxa-overlays/
 
 ## Development Workflow
 
-1. Write/edit the DT overlay (`dts/rk3588-rknpu-overlay.dts`) using vendor DTS as reference
-2. Cross-compile test: `make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -C ref/rknpu-module`
-3. Compile overlay: `dtc -@ -I dts -O dtb -o rk3588-rknpu.dtbo dts/rk3588-rknpu-overlay.dts`
-4. Copy to test board (Orange Pi 5 Pro running Armbian edge 6.19+)
-5. Apply overlay and load module
-6. Verify: `cat /sys/module/rknpu/version` shows `0.9.8`, `/dev/dri/renderD129` exists
-7. Test with librknnrt: run RKNN benchmark or rkllama inference
+The happy path on the board (Armbian 6.18.22+):
+
+1. Edit `dts/rk3588-rknpu-overlay.dts` and/or `patches/*.patch` as needed.
+2. `sudo ./scripts/apply-overlay.sh` — merges the overlay into the boot DTB offline. Idempotent (pristine `.bak` is saved on first run and reused). Runtime configfs application is NOT used — the mainline Rocket driver binds at boot and modifying its live nodes oopses the kernel.
+3. `sudo ./scripts/install-dkms.sh` — stages `ref/rknpu-module` under `/usr/src/rknpu-<ver>/`, applies every `patches/*.patch`, registers with DKMS, builds, installs. Idempotent (removes prior DKMS registration first).
+4. `sudo reboot` — U-Boot picks up the new DTB; `/etc/modules-load.d/rknpu.conf` auto-loads the module.
+5. Verify: `/sys/module/rknpu/version` shows `0.9.8`, `/dev/dri/renderD129` exists, `grep fdab /proc/interrupts` shows 3 rows.
+6. End-to-end inference: `sudo ./scripts/test-inference.sh` downloads vendor librknnrt + mobilenet, runs 200 iterations, prints per-IRQ counter deltas. Expect ~123 inf/s single-core, ~271 inf/s with `CORE_MASK=0_1_2`.
+7. Live NPU activity: `sudo watch -n 0.5 ./scripts/watch-npu.sh`.
 
 ## Test Hardware
 
 ```
-Board:    Orange Pi 5 Pro
-SoC:      RK3588S (3-core NPU, 6 TOPS)
-Current:  Ubuntu 24.04, kernel 6.1.0-1026-rockchip, rknpu 0.9.7
-Target:   Armbian edge, kernel 6.19+
+Board:          Orange Pi 5 Pro
+SoC:            RK3588S (3-core NPU, 6 TOPS)
+Current state:  Armbian Trixie Minimal, kernel 6.18.22-current-rockchip64,
+                rknpu 0.9.8 via DKMS (auto-loads on boot)
 ```
 
 ## Commit Style
