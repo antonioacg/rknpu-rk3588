@@ -2,13 +2,16 @@
 /*
  * Device Tree Overlay for RK3588/RK3588S RKNPU (vendor driver)
  *
- * STATUS: Testing on Armbian 6.18.21 (Orange Pi 5 Pro).
+ * STATUS: Testing on Armbian 6.18.22 (Orange Pi 5 Pro).
  *
  * Converts mainline Rocket NPU nodes into a vendor RKNPU node for
  * rknpu.ko (w568w/rknpu-module). Patches rknn_core_0 in place,
- * disables cores 1/2 and IOMMU nodes.
+ * deletes cores 1/2 and all IOMMU nodes so their IRQ/reg mappings
+ * are released (disabling alone still reserves them in DT).
  *
- * IMPORTANT: rmmod rocket before applying this overlay or insmod rknpu.
+ * Apply via offline fdtoverlay merge into the boot DTB — runtime
+ * configfs application is unsafe because the mainline Rocket driver
+ * binds at boot and modifying live nodes triggers a kernel oops.
  */
 
 /dts-v1/;
@@ -24,27 +27,20 @@
 #define SCMI_CLK_NPU 6
 #endif
 
-/* Disable Rocket cores 1 and 2 */
-&rknn_core_1 {
-	status = "disabled";
-};
-
-&rknn_core_2 {
-	status = "disabled";
-};
-
-/* Disable mainline IOMMU nodes */
-&rknn_mmu_0 {
-	status = "disabled";
-};
-
-&rknn_mmu_1 {
-	status = "disabled";
-};
-
-&rknn_mmu_2 {
-	status = "disabled";
-};
+/*
+ * NOTE: The mainline Rocket driver binds to five sibling nodes that
+ * must be removed before the vendor RKNPU driver probes:
+ *   /npu@fdac0000     (rknn_core_1)
+ *   /npu@fdad0000     (rknn_core_2)
+ *   /iommu@fdab9000   (rknn_mmu_0)
+ *   /iommu@fdaca000   (rknn_mmu_1)
+ *   /iommu@fdada000   (rknn_mmu_2)
+ *
+ * DTC emits `/delete-node/` inside a fragment as a no-op in the
+ * resulting .dtbo (fdtoverlay does not apply node deletions from
+ * overlay fragments), so we remove them out-of-band via `fdtput -r`
+ * in scripts/apply-overlay.sh after the fdtoverlay merge.
+ */
 
 /* OPP table for NPU devfreq */
 &{/} {
@@ -89,7 +85,9 @@
 /*
  * Convert rknn_core_0 (/npu@fdab0000) into the vendor RKNPU node.
  * Override properties in place — no /delete-property/ to avoid
- * kernel oops from removing resolved phandle references at runtime.
+ * kernel oops when the overlay is ever applied at runtime on a
+ * live driver-bound node (offline fdtoverlay is still the blessed
+ * path; this just keeps the overlay safe in both scenarios).
  */
 &rknn_core_0 {
 	compatible = "rockchip,rk3588-rknpu";
@@ -98,9 +96,14 @@
 	      <0x0 0xfdac0000 0x0 0x10000>,
 	      <0x0 0xfdad0000 0x0 0x10000>;
 
-	interrupts = <GIC_SPI 110 IRQ_TYPE_LEVEL_HIGH>,
-	             <GIC_SPI 111 IRQ_TYPE_LEVEL_HIGH>,
-	             <GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH>;
+	/*
+	 * Mainline RK3588 uses arm,gic-v3 with #interrupt-cells = 4
+	 * (the vendor BSP GIC uses 3-cell specs — do not copy verbatim).
+	 * 4th cell is PPI affinity, 0 for SPIs (all CPUs).
+	 */
+	interrupts = <GIC_SPI 110 IRQ_TYPE_LEVEL_HIGH 0>,
+	             <GIC_SPI 111 IRQ_TYPE_LEVEL_HIGH 0>,
+	             <GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH 0>;
 	interrupt-names = "npu0_irq", "npu1_irq", "npu2_irq";
 
 	clocks = <&scmi_clk SCMI_CLK_NPU>,
@@ -127,6 +130,15 @@
 	                <&power RK3588_PD_NPU1>,
 	                <&power RK3588_PD_NPU2>;
 	power-domain-names = "npu0", "npu1", "npu2";
+
+	/*
+	 * Vendor driver looks for "rknpu-supply" / "mem-supply" via
+	 * devm_regulator_get_optional(dev, "rknpu"/"mem").
+	 * Both map to vdd_npu_s0 on the Orange Pi 5 Pro (same regulator
+	 * the mainline DT labelled "npu-supply" / "sram-supply").
+	 */
+	rknpu-supply = <&vdd_npu_s0>;
+	mem-supply = <&vdd_npu_s0>;
 
 	operating-points-v2 = <&npu_opp_table>;
 
