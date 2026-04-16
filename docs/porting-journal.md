@@ -258,15 +258,172 @@ only frequency. If stability issues appear at high frequencies, we'll need a boa
 
 ---
 
+## 2026-04-16 — First boot on Armbian (kernel 6.18.22)
+
+Flashed Armbian Trixie Minimal CLI (Debian 13, kernel 6.18.21 → upgraded to 6.18.22 for
+matching headers) to a microSD. Booted on the Orange Pi 5 Pro alongside the eMMC Ubuntu
+install (SD takes priority). This is the first session against a mainline kernel.
+
+### Major discovery: mainline 6.18+ has Rocket NPU nodes
+
+The mainline RK3588 DTS (`arch/arm64/boot/dts/rockchip/rk3588s.dtsi`) defines the NPU
+hardware for the Rocket driver (merged in Linux 6.18). The architecture is fundamentally
+different from the vendor RKNPU driver:
+
+| Aspect | Vendor RKNPU (what we're porting) | Mainline Rocket (what's in the DTB) |
+|--------|-----------------------------------|-------------------------------------|
+| Node structure | 1 combined node, 3 reg regions | 3 separate nodes (one per core) |
+| Symbols | N/A (we create it) | `rknn_core_0`, `rknn_core_1`, `rknn_core_2` |
+| Addresses | `/npu@fdab0000` (combined) | `/npu@fdab0000`, `/npu@fdac0000`, `/npu@fdad0000` |
+| compatible | `rockchip,rk3588-rknpu` | `rockchip,rk3588-rknn-core` |
+| IRQs per node | 3 | 1 |
+| Clocks per node | 8 (SCMI + 7 CRU) | 4 (aclk, hclk, npu, pclk) |
+| reg-names | (by index) | `pc`, `cna`, `core` (3 sub-regions within each core) |
+| IOMMU nodes | 1 combined | 3 separate (`rknn_mmu_0/1/2`) |
+| IOMMU compat | vendor: `rockchip,iommu-v2` | mainline: `rockchip,rk3588-iommu`, `rockchip,rk3568-iommu` |
+| Driver module | `rknpu` (out-of-tree, this project) | `rocket` (in-tree, `/dev/accel/accel0`) |
+
+This invalidates our original overlay design. The original overlay added a new
+`npu@fdab0000` node at the root, but mainline already has one there — the overlay
+system rejects duplicate unit addresses. The overlay needed a complete rework.
+
+### Overlay rework: patch existing nodes instead of add new ones
+
+New approach:
+
+1. Disable `rknn_core_1` and `rknn_core_2` (their hardware is absorbed into the combined node)
+2. Disable `rknn_mmu_0/1/2` (we'll run without IOMMU until tested)
+3. Patch `rknn_core_0` in place to become the vendor RKNPU node:
+   - Override `compatible` to `rockchip,rk3588-rknpu`
+   - Override `reg` to include all 3 cores' MMIO regions
+   - Override `interrupts` to include all 3 cores' SPIs
+   - Override `clocks`, `clock-names` to vendor's 8-clock layout
+   - Add `resets`, `reset-names`, `power-domain-names`, `interrupt-names`
+   - Add `operating-points-v2` pointing to new OPP table
+4. Add `npu-opp-table` at root (new node, no address conflict)
+
+The node **name** stays `/npu@fdab0000` (can't rename via overlay), but the driver only
+looks at `compatible`, so this is fine.
+
+### Runtime configfs overlay is fundamentally broken for this case
+
+First attempt: apply the overlay via `/sys/kernel/config/device-tree/overlays/rknpu/dtbo`.
+
+**Result**: kernel oops with `Unable to handle kernel paging request at virtual address
+dead000000000122` — a poison pattern indicating use-after-free in the OF overlay subsystem.
+The crash happened during `of_reconfig_notify` when modifying the `power-domains` property.
+
+Root cause: the Rocket driver (`accel/rocket`) was already bound to `rknn_core_0/1/2`
+when the overlay tried to modify their properties. Modifying live driver-bound property
+lists triggers use-after-free on the resolved phandles.
+
+Even without `/delete-property/` directives, just overriding `compatible` and other
+properties causes the same crash. Runtime configfs overlays are unusable for replacing
+driver bindings on a live system.
+
+### Offline DTB merge (fdtoverlay) is the correct path
+
+Armbian boots via U-Boot, which reads the DTB from
+`/boot/dtb/rockchip/rk3588s-orangepi-5-pro.dtb` (a symlink to
+`/boot/dtb-<kver>/rockchip/...`). Merging our overlay into that DTB with `fdtoverlay`
+and rebooting avoids all the runtime overlay problems:
+
+```bash
+# On the target:
+sudo cp /boot/dtb/rockchip/rk3588s-orangepi-5-pro.dtb{,.bak}
+sudo fdtoverlay -i .../rk3588s-orangepi-5-pro.dtb.bak \
+                -o /tmp/merged.dtb /tmp/rk3588-rknpu.dtbo
+sudo cp /tmp/merged.dtb /boot/dtb/rockchip/rk3588s-orangepi-5-pro.dtb
+sudo reboot
+```
+
+**This worked.** After reboot, the NPU node shows `compatible = "rockchip,rk3588-rknpu"`,
+cores 1/2 are `disabled`, the OPP table is present, and the Rocket module doesn't load
+(its compat string no longer matches any live node).
+
+### Module build on 6.18.22: devfreq-governor.h is now private
+
+With the DTB live, building `rknpu.ko` against Armbian's kernel headers failed:
+
+```
+src/rknpu_devfreq.c:14:10: fatal error: linux/devfreq-governor.h: No such file or directory
+```
+
+Starting somewhere between 6.12 and 6.18, `<linux/devfreq-governor.h>` was moved from
+`include/linux/` to a private location (`drivers/devfreq/governor.h`) and is no longer
+exported to out-of-tree modules. The driver uses it for a custom `rknpu_ondemand`
+governor.
+
+Local workaround (patch applied only on the target, not upstream yet):
+
+```c
+#if __has_include(<linux/devfreq-governor.h>)
+#include <linux/devfreq-governor.h>
+#define RKNPU_HAVE_CUSTOM_GOV 1
+#endif
+```
+
+And wrap the custom governor struct, `devfreq_add_governor` call, and
+`devfreq_remove_governor` calls in `#ifdef RKNPU_HAVE_CUSTOM_GOV`. When the header
+isn't available, register the devfreq device with `"simple_ondemand"` instead of
+`"rknpu_ondemand"`. The custom governor's only job is to report the driver-chosen
+ramp-up/ramp-down frequency, so falling back to `simple_ondemand` works — we just
+lose job-submission-triggered ramp control.
+
+With that patch, `rknpu.ko` builds clean against 6.18.22 headers. Needs to be upstreamed
+to w568w/rknpu-module or carried as a patch in this repo.
+
+### Module loads, but probe blocks on IRQ registration
+
+`sudo insmod rknpu.ko` returns 0. dmesg shows:
+
+```
+RKNPU fdab0000.npu: RKNPU: rknpu iommu is disabled, using non-iommu mode
+RKNPU fdab0000.npu: error -EINVAL: request_irq(147) rknpu_core1_irq_handler [rknpu]
+                   0x0 fdab0000.npu
+RKNPU fdab0000.npu: RKNPU: request npu1_irq failed: -22
+RKNPU fdab0000.npu: probe with driver RKNPU failed with error -22
+```
+
+Core 0 IRQ (SPI 110) registers successfully. Core 1 IRQ (SPI 111) fails with `EINVAL`.
+The driver passes `IRQF_SHARED` and `rknpu_dev` as the `dev_id` — but it reuses the
+**same `dev_id`** for all three cores. For `IRQF_SHARED`, `request_irq` requires a
+unique `dev_id` per handler on the same IRQ line, which may be rejected as EINVAL.
+
+But more likely suspect: the disabled `rknn_core_1` node at `/npu@fdac0000` still has
+an `interrupts` property referencing SPI 111. The OF core may still reserve that virq
+mapping for the disabled node, leaving it unavailable for our combined node to claim.
+
+**Still blocked here.** Investigation options for next session:
+1. Use `/delete-node/ &rknn_core_1;` (+ core_2, mmu_0/1/2) in the overlay to remove
+   them entirely instead of disabling. Apply via offline fdtoverlay merge (the only
+   safe path).
+2. Study `rknpu_drv.c` around `rknpu_probe+0x4b8/0x4e4` to confirm whether the probe
+   logic is salvageable or needs adjustment for the combined-node-with-disabled-siblings
+   topology.
+3. Compare `dev_id` passed to `devm_request_irq` — may need a unique cookie per IRQ
+   (e.g., `&rknpu_dev->subcore_datas[i]` instead of `rknpu_dev`).
+
+### Sanity-check results (what IS working)
+
+- DTB symbols on Armbian: 851 (`cru`, `scmi_clk`, `power`, `rknn_core_0/1/2`, `rknn_mmu_0/1/2`)
+- configfs overlays directory exists (`CONFIG_OF_OVERLAY + CONFIG_OF_CONFIGFS` enabled)
+- `fdtoverlay` tool available via `device-tree-compiler` package
+- `/sys/firmware/scmi_dev/` still doesn't exist (expected — missing CONFIG), but SCMI
+  clocks work via the kernel clock framework
+- Kernel headers package name: `linux-headers-current-rockchip64` (pulls in matching
+  image; doesn't offer a version-pinned flavour)
+- After reboot with merged DTB: Rocket module (`rocket`, `drm_shmem_helper`, `gpu_sched`)
+  doesn't load, confirming our compat override took effect
+
+---
+
 ## Next steps
 
-1. **Get Armbian edge image** for Orange Pi 5 Pro (kernel 6.19+)
-2. **Flash to SD card** — boot from SD, keep eMMC intact
-3. **Verify on Armbian edge**:
-   - Does the DTB have `__symbols__`?
-   - Does configfs runtime overlays work? If not, use boot-time overlay
-   - Is `SCMI_CLK_NPU` available?
-   - Are power domains accessible?
-4. **Apply overlay and load module** — follow the 9-step test plan from the PR
-5. **CMA sizing** — may need `cma=128M` boot parameter for NPU inference
-6. **Voltage scaling** — monitor stability at 900 MHz / 1 GHz without explicit regulator reference
+1. Unblock the IRQ registration (see three options above)
+2. Once module probes cleanly, verify `/dev/dri/renderD*` appears and `cat /sys/module/rknpu/version` shows `0.9.8`
+3. Run librknnrt smoke test from `ref/rknn-llm/`
+4. Upstream the `devfreq-governor.h` conditional patch to w568w/rknpu-module
+5. Optional: test IOMMU by re-enabling `rknn_mmu_0` and switching the combined node's
+   `iommus` property back on
+6. Evaluate `cma=128M` boot parameter for NPU inference stability
