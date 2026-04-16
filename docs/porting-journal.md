@@ -525,14 +525,78 @@ $ grep fdab /proc/interrupts
 148: ... GICv3 144 Level  fdab0000.npu
 ```
 
+### Passive smoke test
+
+`scripts/test-rknn.sh` (runs on the board) confirms the userspace path end to
+end without exercising the NPU:
+
+```
+DRM identity via /dev/dri/renderD129:
+  driver     : rknpu
+  version    : 0.9.8
+  description: RKNPU driver
+
+Debugfs (/sys/kernel/debug/rknpu/):
+  version  : RKNPU driver: v0.9.8
+  freq     : 200000000
+  volt     : 800000
+  power    : off
+  load     : NPU load:  Core0:  0%, Core1:  0%, Core2:  0%,
+
+NPU interrupts:
+  146: 142 fdab0000.npu
+  147: 143 fdab0000.npu
+  148: 144 fdab0000.npu
+```
+
+The DRM `DRM_IOCTL_VERSION` ioctl identifies the driver as `"rknpu"` (vendor),
+which confirms the overlay and binding, not the mainline `"rocket"` stack.
+Debugfs entries are live (the `load` file was what made it into the original
+user question — it exists as soon as the module is loaded; if it's missing,
+the module isn't loaded).
+
+A real inference test still needs `librknnrt.so` (from airockchip's
+rknn-toolkit2 repo, not submoduled here) and an `.rknn` model file. Drop those
+onto the board and run `rknn_benchmark <model>` to verify end-to-end.
+
+### Known issue: devfreq userspace governor hangs the board
+
+Switching the `fdab0000.npu` devfreq governor to `userspace` and then writing
+a frequency (via `max_freq`/`min_freq`/`userspace/set_freq`) freezes the board
+— SSH becomes unresponsive, LEDs stay steady, a hard power-cycle is the only
+recovery. The passive devfreq reads are fine; only *writes* trigger the hang.
+
+Most likely cause: the `simple_ondemand` fallback governor (from our
+`patches/0001-devfreq-governor-conditional.patch`) drives the SCMI clock +
+power-domain transition without the vendor's `rockchip_system_monitor` layer,
+which would normally coordinate voltage-first / frequency-second ordering and
+suppress transitions while jobs are queued. When userspace forces a
+transition, the SCP firmware path deadlocks or gets into a state the kernel
+never recovers from.
+
+Workarounds for now:
+- Leave devfreq on its default governor (`simple_ondemand` here, chosen
+  automatically because our overlay's OPP table has `opp-microvolt`).
+- Do not poke `min_freq` / `max_freq` / `set_freq` from userspace.
+
+Real fix is upstream work: either port enough of `rockchip_system_monitor` /
+`rockchip_opp_select` to the out-of-tree module, or rebuild the custom
+`rknpu_ondemand` governor on top of private API that the module ships itself
+instead of the kernel's `<linux/devfreq-governor.h>`.
+
 ## Next steps
 
-1. Run librknnrt smoke test (vendor benchmark or small RKNN inference) against
-   `/dev/dri/renderD129`; confirm IRQ counters bump and NPU is executing.
+1. **Run a real RKNN model** — drop `librknnrt.so` + an `.rknn` from
+   airockchip/rknn-toolkit2 on the board and run `rknn_benchmark`. Expect
+   `/proc/interrupts` for `fdab0000.npu` to start counting and
+   `/sys/kernel/debug/rknpu/load` to rise during the run.
 2. Upstream `patches/0001-devfreq-governor-conditional.patch` to
    w568w/rknpu-module so the carry is temporary.
-3. Optional: wire a working IOMMU node and re-enable `iommus` on the combined
+3. Investigate the devfreq userspace-write hang (see "Known issue" above).
+   Low priority if the default governor is stable — no consumer we care about
+   pokes devfreq from userspace.
+4. Optional: wire a working IOMMU node and re-enable `iommus` on the combined
    node (IOMMU v2 has the `dead000000000122` bug history — test incrementally
    with `cma=128M` fallback first).
-4. Evaluate whether the OPP table needs a 200 MHz entry (driver's initial
+5. Evaluate whether the OPP table needs a 200 MHz entry (driver's initial
    frequency is lower than the table's min of 300 MHz).
