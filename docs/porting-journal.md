@@ -614,14 +614,27 @@ Real fix is upstream work: either port enough of `rockchip_system_monitor` /
 `rknpu_ondemand` governor on top of private API that the module ships itself
 instead of the kernel's `<linux/devfreq-governor.h>`.
 
+### DKMS install (persistence across reboots)
+
+`scripts/install-dkms.sh` stages the submodule under `/usr/src/rknpu-<ver>/`,
+applies `patches/*.patch`, and registers with DKMS. Verified on Armbian
+6.18.22:
+
+- Module auto-builds on kernel upgrades via the DKMS hook.
+- Auto-loads at boot (measured 4.0s after kernel start) when
+  `/etc/modules-load.d/rknpu.conf` contains `rknpu`.
+- `/dev/dri/renderD129` is present before login; no manual insmod needed.
+- Re-running the script is idempotent (removes the previous DKMS
+  registration first).
+
+This makes the clone-run-reboot-still-works experience hold, which is
+what a downstream consumer actually sees.
+
 ## Next steps
 
-1. Install via DKMS so the module persists across reboots. Currently the
-   build + insmod cycle only lives in `/tmp`, so every reboot requires a
-   rebuild. `scripts/install-dkms.sh` exists but hasn't been exercised
-   against the patched tree.
-2. Upstream `patches/0001-devfreq-governor-conditional.patch` to
-   w568w/rknpu-module so the carry becomes temporary.
+1. Upstream `patches/0001-devfreq-governor-conditional.patch` to
+   w568w/rknpu-module so the carry becomes temporary. See issue #2 for
+   the pre-upstream review checklist (security + memory audit).
 3. Restore NPU frequency scaling (see Known Issues). Either feed
    `simple_ondemand` a proper busy/total signal from the driver, or port
    parts of `rockchip_system_monitor` to rebuild the vendor's custom
