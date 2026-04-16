@@ -1,6 +1,6 @@
 # RK3588 NPU Hardware Reference
 
-All values sourced from the Rockchip vendor kernel DTS (`rk3588s.dtsi` from rockchip-linux/kernel develop-5.10 and develop-6.6) and cross-referenced with the mainline kernel DTS.
+All values sourced from the Rockchip vendor kernel DTS (`rk3588s.dtsi` from rockchip-linux/kernel develop-5.10 and develop-6.6) and cross-referenced with the mainline kernel DTS. Values that ended up in the shipping overlay were additionally verified against the live DT on an Orange Pi 5 Pro running Armbian 6.18.22.
 
 ## Register Map
 
@@ -9,12 +9,14 @@ All values sourced from the Rockchip vendor kernel DTS (`rk3588s.dtsi` from rock
 | NPU Core 0 | `0xfdab0000` - `0xfdabffff` | 64KB | Core 0 registers |
 | NPU Core 1 | `0xfdac0000` - `0xfdacffff` | 64KB | Core 1 registers |
 | NPU Core 2 | `0xfdad0000` - `0xfdadffff` | 64KB | Core 2 registers |
-| NPU IOMMU (core0-a) | `0xfdab9000` - `0xfdab90ff` | 256B | IOMMU region A, core 0 |
-| NPU IOMMU (core0-b) | `0xfdaba000` - `0xfdaba0ff` | 256B | IOMMU region B, core 0 |
-| NPU IOMMU (core1) | `0xfdaca000` - `0xfdaca0ff` | 256B | IOMMU, core 1 |
-| NPU IOMMU (core2) | `0xfdada000` - `0xfdada0ff` | 256B | IOMMU, core 2 |
+| NPU IOMMU (core0-a) | `0xfdab9000` - `0xfdab90ff` | 256B | IOMMU region A, core 0 (see note) |
+| NPU IOMMU (core0-b) | `0xfdaba000` - `0xfdaba0ff` | 256B | IOMMU region B, core 0 (see note) |
+| NPU IOMMU (core1) | `0xfdaca000` - `0xfdaca0ff` | 256B | IOMMU, core 1 (see note) |
+| NPU IOMMU (core2) | `0xfdada000` - `0xfdada0ff` | 256B | IOMMU, core 2 (see note) |
 | NPU GRF | `0xfd5a2000` - `0xfd5a20ff` | 256B | General Register File (syscon) |
 | NPU PVTM | `0xfdaf0000` - `0xfdaf00ff` | 256B | Process-Voltage-Temperature Monitor |
+
+**IOMMU note.** The current shipping overlay runs with `iommus` stripped from the combined node (non-IOMMU mode). The mainline Rocket DT exposes the IOMMUs as sibling nodes (`/iommu@fdab9000/fdaca000/fdada000`) which `scripts/apply-overlay.sh` deletes post-merge. Re-enabling the IOMMU is an open work item — addresses are recorded here for that future effort.
 
 ## Interrupts
 
@@ -23,6 +25,8 @@ All values sourced from the Rockchip vendor kernel DTS (`rk3588s.dtsi` from rock
 | npu0_irq | 110 | LEVEL_HIGH | NPU Core 0 interrupt |
 | npu1_irq | 111 | LEVEL_HIGH | NPU Core 1 interrupt |
 | npu2_irq | 112 | LEVEL_HIGH | NPU Core 2 interrupt |
+
+**Cell count note.** Mainline RK3588 DT binds the GIC as `arm,gic-v3` with `#interrupt-cells = 4` (the 4th cell is the PPI affinity mask; 0 for SPIs). The vendor BSP DT binds it with 3 cells. Copying a 3-cell `interrupts` property from the BSP DTS into a mainline overlay will silently misalign the parser — see [porting-journal.md](porting-journal.md) § "IRQ blocker resolved" for the symptom and diagnostic. Always use 4-cell tuples on mainline.
 
 ## Clocks
 

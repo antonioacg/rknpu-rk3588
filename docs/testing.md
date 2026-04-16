@@ -1,110 +1,203 @@
 # Testing Procedures
 
-## Test Environment
+Runbook for validating this repo on a fresh board. For the engineering
+history of how we got the driver working (and every blocker along the
+way), see [porting-journal.md](porting-journal.md).
+
+## Reference environment
 
 | Item | Value |
 |------|-------|
 | Board | Orange Pi 5 Pro |
-| SoC | RK3588S |
-| RAM | 16GB |
-| Current OS | Ubuntu 24.04, kernel 6.1.0-1026-rockchip |
-| Current NPU | rknpu 0.9.7, `/dev/dri/renderD129` |
-| Target OS | Armbian edge, kernel 6.19+ |
+| SoC | RK3588S (3-core NPU, 6 TOPS) |
+| RAM | 16 GB |
+| OS | Armbian Trixie Minimal |
+| Kernel | `6.18.22-current-rockchip64` |
+| Driver | `rknpu 0.9.8` (DKMS, auto-loads on boot) |
+| Vendor SDK | librknnrt 2.3.2 (airockchip/rknn-toolkit2) |
 
-## Pre-flight Checks
+Any board with an `arm,gic-v3` interrupt controller using
+`#interrupt-cells = 4`, SCMI clocks, and a compatible 3-core NPU at
+`0xfdab0000/0xfdac0000/0xfdad0000` should also work — but nothing else
+has been validated yet.
 
-Before testing the DKMS module, verify the target system:
+## Pre-flight checks
+
+On the target board, before applying the overlay or loading the module:
 
 ```bash
-# 1. Check kernel version (must be 6.19+)
+sudo ./scripts/check-hardware.sh
+```
+
+Expected: `0 failed`. `CMA` and `SCMI` may warn on some distros —
+they don't block the module loading but may affect stability under
+load.
+
+Manual spot-checks if the script isn't available:
+
+```bash
+# SoC: must be rk3588 or rk3588s
+tr '\0' '\n' < /proc/device-tree/compatible
+
+# Kernel >= 6.18
 uname -r
 
-# 2. Check SoC compatibility
-cat /proc/device-tree/compatible
-
-# 3. Check if NPU node already exists (it shouldn't on mainline)
-ls /proc/device-tree/npu@fdab0000/ 2>/dev/null && echo "NPU node exists" || echo "NPU node missing (expected)"
-
-# 4. Check SCMI firmware
-ls /sys/firmware/scmi_dev/*/
-
-# 5. Check power domains
-cat /sys/kernel/debug/pm_genpd/pm_genpd_summary 2>/dev/null | grep -i npu
-
-# 6. Check available DMA/CMA
-cat /proc/meminfo | grep -i cma
+# GIC is arm,gic-v3 with #interrupt-cells = 4 (our overlay depends on this)
+tr '\0' '\n' < /sys/firmware/devicetree/base/interrupt-controller@fe600000/compatible
+od -An -tx4 /sys/firmware/devicetree/base/interrupt-controller@fe600000/\#interrupt-cells
 ```
 
-## Test 1: Compile DT Overlay
+## Test 1 — Overlay compile + merge
 
 ```bash
-dtc -@ -I dts -O dtb -o rk3588-rknpu.dtbo dts/rk3588-rknpu-overlay.dts
-echo "Exit code: $?"
+sudo ./scripts/apply-overlay.sh
 ```
 
-Expected: exit code 0, no errors. Warnings about missing phandle targets are expected when compiling without a base DTB.
+Expected output ends with `Done. Reboot to activate the overlay.` and
+the cpp/dtc/fdtoverlay/fdtput steps all succeed. The pristine DTB is
+saved to `<target>.dtb.bak` on the first run (idempotent).
 
-## Test 2: Build Kernel Module
+Troubleshooting:
+
+- **`dtc: syntax error`** — check the kernel headers package matches
+  the running kernel. The overlay `#include`s `dt-bindings/*` from
+  `/lib/modules/$(uname -r)/build/include/`.
+- **`fdtput: FDT_ERR_NOTFOUND`** when removing siblings — harmless if
+  the nodes are already absent (e.g. a rerun after a successful merge).
+- **`__symbols__` missing** from the base DTB — the overlay can't
+  resolve `&cru`, `&scmi_clk`, `&power`. Rebuild the board DTB with
+  `dtc -@` or request one from the distro.
+
+## Test 2 — DKMS install
 
 ```bash
-cd ref/rknpu-module
-make KDIR=/lib/modules/$(uname -r)/build
-echo "Exit code: $?"
-ls -la rknpu.ko
+sudo ./scripts/install-dkms.sh
+echo rknpu | sudo tee /etc/modules-load.d/rknpu.conf
+sudo reboot
 ```
 
-Expected: `rknpu.ko` produced without errors.
-
-## Test 3: Load DT Overlay
+After reboot:
 
 ```bash
-sudo mkdir -p /sys/kernel/config/device-tree/overlays/rknpu
-sudo cat rk3588-rknpu.dtbo > /sys/kernel/config/device-tree/overlays/rknpu/dtbo
+# Module loaded automatically
+lsmod | grep rknpu
 
-# Verify node appeared
-ls /proc/device-tree/npu@fdab0000/
-```
-
-Expected: NPU node appears in `/proc/device-tree/`.
-
-## Test 4: Load Kernel Module
-
-```bash
-sudo insmod ref/rknpu-module/rknpu.ko
-dmesg | tail -20
-
-# Verify
+# Version is 0.9.8
 cat /sys/module/rknpu/version
-ls /dev/dri/renderD*
+
+# DRM device is present
+ls /dev/dri/renderD129
+
+# No probe errors
+sudo dmesg | grep -i rknpu | grep -iE 'error|fail|warn'   # should be empty
 ```
 
-Expected: rknpu version `0.9.8`, `/dev/dri/renderD129` present.
+Expected `dmesg` probe trace (clean boot):
 
-## Test 5: RKNN Runtime Smoke Test
+```
+rknpu: loading out-of-tree module taints kernel.
+RKNPU fdab0000.npu: RKNPU: rknpu iommu device-tree entry not found!, using non-iommu mode
+[drm] Initialized rknpu 0.9.8 for fdab0000.npu on minor 2
+RKNPU fdab0000.npu: RKNPU: devfreq enabled, initial freq: 200000000 Hz, volt: 800000 uV
+```
 
-Requires `librknnrt.so` from `ref/rknn-llm/rknn-runtime/`.
+The "iommu device-tree entry not found" line is intentional — see the
+porting journal for why we strip the `iommus` property.
+
+Troubleshooting:
+
+- **`modinfo: not found`** — Armbian minimal doesn't ship kmod utilities
+  on `$PATH` for unprivileged users. Use `/sbin/modinfo` or `sudo modinfo`.
+- **Probe fails with `request_irq(N) EINVAL`** — GIC interrupt-cells
+  mismatch. Check `#interrupt-cells` on the live interrupt-controller
+  (see pre-flight). Our overlay assumes 4.
+- **Module loads but `/dev/dri/renderD129` missing** — the overlay
+  didn't merge, or the bootloader loaded an older DTB. Check
+  `readlink -f /boot/dtb` matches what `apply-overlay.sh` targeted.
+
+## Test 3 — Passive smoke test
+
+Confirms userspace can open the DRM device and the debugfs + IRQ
+bindings are live. Does not run any inference.
 
 ```bash
-# Check if the runtime can open the device
-LD_LIBRARY_PATH=ref/rknn-llm/rknn-runtime/Linux/librknn_api/aarch64/ \
-  scripts/test-rknn.sh
+sudo ./scripts/test-rknn.sh
 ```
 
-Expected: Runtime reports NPU device with 3 cores, 6 TOPS.
+Expected output ends with:
 
-## Test 6: IOMMU (Optional, Advanced)
+```
+Smoke test passed: driver responds, debugfs live, 3/3 IRQs bound.
+```
 
-Only attempt after Tests 1-5 pass with IOMMU disabled.
+## Test 4 — End-to-end inference (the real smoke test)
 
-1. Edit the overlay: change IOMMU `status` from `"disabled"` to `"okay"`.
-2. Recompile and reload the overlay.
-3. Load the module and check dmesg for IOMMU errors.
-4. Run Test 5 again.
+Downloads `librknnrt.so` + `mobilenet_v1.rknn` from
+airockchip/rknn-toolkit2, compiles `tests/rknn_smoke.c` against them,
+runs 200 iterations, prints timing and IRQ counter deltas.
 
-Watch for: bus errors, page table allocation failures, DMA mapping errors in dmesg.
+```bash
+sudo ./scripts/test-inference.sh
+```
 
-## Results Log
+Expected (within ±20% on the same board):
 
-| Test | Date | Kernel | Board | Result | Notes |
-|------|------|--------|-------|--------|-------|
-| -- | -- | -- | -- | -- | No tests performed yet |
+```
+SDK api=2.3.2 (429f97ae6b@2025-04-09T09:09:27) driver=0.9.8
+inputs=1 outputs=1
+  in[0] name=input dims=[1,224,224,3] size=150528 fmt=NHWC
+
+=== RESULTS ===
+iterations  : 200
+per-inference: ~8 ms
+throughput  : ~123 inf/s
+
+Non-zero interrupt deltas on virq 146/147/148 mean the NPU actually executed.
+```
+
+Multi-core version (exercises all three NPU cores, confirms all three
+IRQs fire):
+
+```bash
+sudo CORE_MASK=0_1_2 ITERS=300 ./scripts/test-inference.sh
+```
+
+Expected: ~3.7 ms/inference, ~271 inf/s, `load` in
+`/sys/kernel/debug/rknpu/load` showing Core0/1/2 all in the 70–80%
+range during the run.
+
+## Live monitoring
+
+For eyeballing what happens while a workload runs:
+
+```bash
+sudo watch -n 0.5 ./scripts/watch-npu.sh
+```
+
+Updates at 2 Hz with `freq`, `volt`, `power`, per-core `load`, and per-IRQ
+counters.
+
+## Known issues (do NOT step on these)
+
+- **Writing to devfreq sysfs hangs the board.** Setting `governor` to
+  `userspace` and writing `min_freq`/`max_freq`/`set_freq` triggers an
+  SCMI/PD deadlock that requires a physical power-cycle. Passive reads
+  are fine. See porting journal "Known issue: devfreq userspace
+  governor hangs the board".
+- **NPU frequency doesn't scale up under load.** The vendor's custom
+  devfreq governor relied on `rockchip_system_monitor` which isn't in
+  mainline; our `simple_ondemand` fallback doesn't get the busy signal
+  it expects. Performance measured above is the floor, not the ceiling.
+- **IOMMU is disabled.** Re-enabling it requires wiring a working IOMMU
+  node and is tracked as an open item. Current non-IOMMU mode works for
+  all tested workloads.
+
+## Results log
+
+| Date | Kernel | Board | Test | Result | Notes |
+|------|--------|-------|------|--------|-------|
+| 2026-04-16 | 6.18.22-current-rockchip64 | Orange Pi 5 Pro (RK3588S) | Test 1 (overlay merge) | PASS | cpp/dtc/fdtoverlay/fdtput all clean |
+| 2026-04-16 | 6.18.22-current-rockchip64 | Orange Pi 5 Pro (RK3588S) | Test 2 (DKMS install) | PASS | auto-load 4.0 s after kernel start |
+| 2026-04-16 | 6.18.22-current-rockchip64 | Orange Pi 5 Pro (RK3588S) | Test 3 (smoke) | PASS | DRM_IOCTL_VERSION reports driver=rknpu 0.9.8, 3/3 IRQs bound |
+| 2026-04-16 | 6.18.22-current-rockchip64 | Orange Pi 5 Pro (RK3588S) | Test 4 single-core | PASS | MobileNet v1 @ 123.3 inf/s (8.11 ms) |
+| 2026-04-16 | 6.18.22-current-rockchip64 | Orange Pi 5 Pro (RK3588S) | Test 4 all-3-cores | PASS | MobileNet v1 @ 270.9 inf/s (3.69 ms); Core0 78%, Core1/2 73% |
