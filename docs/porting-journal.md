@@ -555,9 +555,39 @@ Debugfs entries are live (the `load` file was what made it into the original
 user question — it exists as soon as the module is loaded; if it's missing,
 the module isn't loaded).
 
-A real inference test still needs `librknnrt.so` (from airockchip's
-rknn-toolkit2 repo, not submoduled here) and an `.rknn` model file. Drop those
-onto the board and run `rknn_benchmark <model>` to verify end-to-end.
+### Real inference on the NPU (2026-04-16)
+
+`scripts/test-inference.sh` downloads `librknnrt.so` + `rknn_api.h` +
+`mobilenet_v1.rknn` from airockchip/rknn-toolkit2, compiles
+`tests/rknn_smoke.c`, and runs inference against the real NPU. Results
+on Armbian 6.18.22 / Orange Pi 5 Pro:
+
+```
+SDK api=2.3.2 (429f97ae6b@2025-04-09T09:09:27) driver=0.9.8
+
+core_mask=auto   iters=200   8.11 ms/inf   123.3 inf/s
+core_mask=0_1_2  iters=300   3.69 ms/inf   270.9 inf/s
+```
+
+- **Single-core baseline**: 123 inf/s MobileNet v1, matching vendor
+  expectations for RK3588 NPU at the lowest OPP.
+- **Multi-core**: 2.2× scaling to 271 inf/s, with all three cores
+  registering work (debugfs `load` showed Core0: 78%, Core1: 73%,
+  Core2: 73% during a run). IRQ counters on virq 146/147/148 all
+  incremented proportionally (~2× iters for core 0 in multi-core,
+  ~2× iters / 3 for cores 1 and 2).
+- **Performance is at the floor**: `freq` and `volt` stayed pinned at
+  200 MHz / 800 mV the whole time. The vendor's custom governor would
+  have scaled up under load; our `simple_ondemand` fallback doesn't
+  receive the busy signal in the shape it expects, so the OPP never
+  changes. A 1 GHz OPP would be 3–5× faster but requires either a
+  driver patch that feeds devfreq a proper busy/total ratio, or
+  porting parts of `rockchip_system_monitor` back in.
+
+This **validates the project's core hypothesis**: the vendor RKNN SDK
+binaries work against our mainline-kernel driver port. Downstream
+consumers (rkllama + Gemma on NPU, or any other librknnrt-based
+pipeline) have a proven foundation to build on.
 
 ### Known issue: devfreq userspace governor hangs the board
 
@@ -586,17 +616,23 @@ instead of the kernel's `<linux/devfreq-governor.h>`.
 
 ## Next steps
 
-1. **Run a real RKNN model** — drop `librknnrt.so` + an `.rknn` from
-   airockchip/rknn-toolkit2 on the board and run `rknn_benchmark`. Expect
-   `/proc/interrupts` for `fdab0000.npu` to start counting and
-   `/sys/kernel/debug/rknpu/load` to rise during the run.
+1. Install via DKMS so the module persists across reboots. Currently the
+   build + insmod cycle only lives in `/tmp`, so every reboot requires a
+   rebuild. `scripts/install-dkms.sh` exists but hasn't been exercised
+   against the patched tree.
 2. Upstream `patches/0001-devfreq-governor-conditional.patch` to
-   w568w/rknpu-module so the carry is temporary.
-3. Investigate the devfreq userspace-write hang (see "Known issue" above).
-   Low priority if the default governor is stable — no consumer we care about
-   pokes devfreq from userspace.
-4. Optional: wire a working IOMMU node and re-enable `iommus` on the combined
-   node (IOMMU v2 has the `dead000000000122` bug history — test incrementally
-   with `cma=128M` fallback first).
-5. Evaluate whether the OPP table needs a 200 MHz entry (driver's initial
-   frequency is lower than the table's min of 300 MHz).
+   w568w/rknpu-module so the carry becomes temporary.
+3. Restore NPU frequency scaling (see Known Issues). Either feed
+   `simple_ondemand` a proper busy/total signal from the driver, or port
+   parts of `rockchip_system_monitor` to rebuild the vendor's custom
+   `rknpu_ondemand` governor. 3–5× throughput headroom is currently
+   locked behind this.
+4. Investigate the devfreq userspace-write hang (see Known Issues). Low
+   priority if the default governor stays stable — no consumer we care
+   about writes to devfreq from userspace.
+5. Optional: wire a working IOMMU node and re-enable `iommus` on the
+   combined node (IOMMU v2 has the `dead000000000122` bug history — test
+   incrementally with `cma=128M` fallback first).
+6. Evaluate whether the OPP table needs a 200 MHz entry (driver's initial
+   frequency is lower than the table's current min of 300 MHz; likely why
+   the NPU starts at 200 MHz and can't scale down further).
