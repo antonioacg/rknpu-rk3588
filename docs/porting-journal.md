@@ -418,12 +418,121 @@ mapping for the disabled node, leaving it unavailable for our combined node to c
 
 ---
 
+## 2026-04-16 — IRQ blocker resolved; module probes cleanly on 6.18.22
+
+### Root cause: GIC-v3 `#interrupt-cells = 4` on mainline
+
+None of the three theories from the prior session was correct. The real cause
+was a device-tree cell-count mismatch that the overlay had silently inherited
+from the vendor BSP.
+
+- Mainline RK3588 DT: `interrupt-controller@fe600000` with
+  `compatible = "arm,gic-v3"` and **`#interrupt-cells = 4`** (the 4th cell is
+  the PPI affinity mask; 0 for SPIs).
+- Vendor BSP DT: same GIC but `#interrupt-cells = 3`.
+
+Our overlay copied the BSP form verbatim:
+
+```
+interrupts = <GIC_SPI 110 IRQ_TYPE_LEVEL_HIGH>,
+             <GIC_SPI 111 IRQ_TYPE_LEVEL_HIGH>,
+             <GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH>;
+```
+
+That encoded 9 cells. Reading them as 4-cell tuples (what the live DT
+expects), the kernel resolved:
+
+| Tuple | cells          | type      | num | flags     | affinity | result        |
+|-------|----------------|-----------|-----|-----------|----------|---------------|
+| 1     | `<0 110 4 0>`  | SPI       | 110 | LVL_HIGH  | 0        | virq 146 ✓    |
+| 2     | `<111 4 0 111>`| junk(111) | 4   | 0         | 111      | virq 147 w/ `hwirq=0, type=edge` |
+| 3     | (misaligned)   | —         | —   | —         | —        | never mapped  |
+
+The first IRQ worked by pure luck — cell #3 happened to be 0, which is a
+valid PPI-affinity-mask value. Tuples 2 and 3 were offset by one cell each
+and became garbage. `request_threaded_irq()` then WARNed and returned
+`-EINVAL` for the bogus virq 147.
+
+### Diagnostic that exposed it
+
+Before the fix, on the live board:
+
+```bash
+$ cat /sys/kernel/irq/147/hwirq   # expected 143 (32+SPI 111)
+0
+$ cat /sys/kernel/irq/147/type    # expected "level"
+edge
+```
+
+These two numbers — `hwirq=0` and `type=edge` where DT said level-high —
+were the smoking gun. Future bring-ups on unfamiliar SoCs should always
+sanity-check `/sys/kernel/irq/<virq>/{hwirq,type}` against the DT spec
+before blaming the driver.
+
+### Fix
+
+`dts/rk3588-rknpu-overlay.dts` now uses 4-cell interrupt tuples:
+
+```
+interrupts = <GIC_SPI 110 IRQ_TYPE_LEVEL_HIGH 0>,
+             <GIC_SPI 111 IRQ_TYPE_LEVEL_HIGH 0>,
+             <GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH 0>;
+```
+
+### Residual loose ends that were also tied up this session
+
+1. **Dangling `iommus` phandle.** The pristine `rknn_core_0` referenced
+   `rknn_mmu_0`. Our overlay replaced other properties but not `iommus`,
+   which left the patched node pointing at a phandle we later deleted via
+   `fdtput -r`. The kernel logs `iommu device-tree entry not found` but
+   could also corrupt state. The merge pipeline now strips the property
+   with `fdtput -d /npu@fdab0000 iommus` after the merge.
+
+2. **OPP regulator name mismatch.** The driver calls
+   `devm_regulator_get_optional(dev, "rknpu")` and `"mem"`, looking for
+   `rknpu-supply` / `mem-supply`. The original node only had `npu-supply`
+   and `sram-supply`. Added both `rknpu-supply = <&vdd_npu_s0>` and
+   `mem-supply = <&vdd_npu_s0>` (same regulator the original node used).
+   devfreq now prints `RKNPU: devfreq enabled, initial freq: 200000000 Hz,
+   volt: 800000 uV` instead of failing the OPP setup.
+
+3. **`/delete-node/` inside an overlay fragment is a no-op.** DTC compiles
+   it into an empty `__overlay__` block; `fdtoverlay` emits no deletion
+   opcodes. The merge script deletes the Rocket sibling nodes
+   (`/npu@fdac0000`, `/npu@fdad0000`, `/iommu@fdab9000/fdaca000/fdada000`)
+   post-merge with `fdtput -r`.
+
+4. **Offline-only reproducibility.** Ad-hoc shell commands are replaced by
+   `scripts/apply-overlay.sh` (cpp → dtc → fdtoverlay → fdtput -r/-d) and
+   `scripts/build-module.sh` (stages the submodule into `build/`, applies
+   `patches/0001-devfreq-governor-conditional.patch`, builds).
+
+### Final verification (Armbian 6.18.22 on Orange Pi 5 Pro)
+
+```
+[drm] Initialized rknpu 0.9.8 for fdab0000.npu on minor 2
+RKNPU fdab0000.npu: RKNPU: devfreq enabled, initial freq: 200000000 Hz, volt: 800000 uV
+```
+
+```
+$ ls /dev/dri/
+card0  card1  card2  renderD128  renderD129
+$ cat /sys/module/rknpu/version
+0.9.8
+$ grep fdab /proc/interrupts
+146: ... GICv3 142 Level  fdab0000.npu
+147: ... GICv3 143 Level  fdab0000.npu
+148: ... GICv3 144 Level  fdab0000.npu
+```
+
 ## Next steps
 
-1. Unblock the IRQ registration (see three options above)
-2. Once module probes cleanly, verify `/dev/dri/renderD*` appears and `cat /sys/module/rknpu/version` shows `0.9.8`
-3. Run librknnrt smoke test from `ref/rknn-llm/`
-4. Upstream the `devfreq-governor.h` conditional patch to w568w/rknpu-module
-5. Optional: test IOMMU by re-enabling `rknn_mmu_0` and switching the combined node's
-   `iommus` property back on
-6. Evaluate `cma=128M` boot parameter for NPU inference stability
+1. Run librknnrt smoke test (vendor benchmark or small RKNN inference) against
+   `/dev/dri/renderD129`; confirm IRQ counters bump and NPU is executing.
+2. Upstream `patches/0001-devfreq-governor-conditional.patch` to
+   w568w/rknpu-module so the carry is temporary.
+3. Optional: wire a working IOMMU node and re-enable `iommus` on the combined
+   node (IOMMU v2 has the `dead000000000122` bug history — test incrementally
+   with `cma=128M` fallback first).
+4. Evaluate whether the OPP table needs a 200 MHz entry (driver's initial
+   frequency is lower than the table's min of 300 MHz).
