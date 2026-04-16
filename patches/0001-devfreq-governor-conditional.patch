@@ -1,0 +1,95 @@
+From: rknpu-rk3588 project <noreply@example.invalid>
+Subject: [PATCH] devfreq: make <linux/devfreq-governor.h> include conditional
+
+The Rockchip vendor NPU driver defines its own devfreq governor
+("rknpu_ondemand") which forwards the frequency decision made by the
+Rockchip system_monitor / SCMI stack straight to the devfreq core.
+Registering a custom governor requires <linux/devfreq-governor.h>, but
+that header is private to drivers/devfreq/ since Linux 5.16+ and is
+not exported to out-of-tree modules as of 6.18 (the header only exists
+in the kernel tree itself, not in the -headers package).
+
+Guard the include with __has_include() and fall back to the in-kernel
+"simple_ondemand" governor when the private header is absent. This
+loses the vendor's system_monitor integration (voltage/thermal-driven
+frequency selection) but keeps devfreq working end-to-end, which is
+what consumers of /dev/dri/renderD129 need for the RKNN SDK.
+
+The `RKNPU_HAVE_CUSTOM_GOV` macro toggles every site that references
+the custom governor struct (`devfreq_rknpu_ondemand`), so the module
+compiles cleanly on both old and new kernels without polluting the
+call sites further.
+
+Applies to w568w/rknpu-module as shipped by that repo's HEAD at the
+time this patch was authored. Re-diff if upstream moves things.
+
+--- a/src/rknpu_devfreq.c
++++ b/src/rknpu_devfreq.c
+@@ -11,7 +11,10 @@
+
+ #include <linux/clk.h>
+ #include <linux/devfreq.h>
++#if __has_include(<linux/devfreq-governor.h>)
+ #include <linux/devfreq-governor.h>
++#define RKNPU_HAVE_CUSTOM_GOV 1
++#endif
+ #include <linux/pm_opp.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/regulator/consumer.h>
+@@ -28,6 +31,7 @@
+ /*  The governor simply forwards that frequency to the devfreq core.  */
+ /* ------------------------------------------------------------------ */
+
++#ifdef RKNPU_HAVE_CUSTOM_GOV
+ static int devfreq_rknpu_ondemand_func(struct devfreq *df,
+ 				       unsigned long *freq)
+ {
+@@ -52,6 +56,7 @@
+ 	.get_target_freq = devfreq_rknpu_ondemand_func,
+ 	.event_handler = devfreq_rknpu_ondemand_handler,
+ };
++#endif
+
+ /* ------------------------------------------------------------------ */
+ /*  devfreq profile callbacks                                         */
+@@ -197,15 +202,21 @@
+
+ 	dp->initial_freq = rknpu_dev->current_freq;
+
++#ifdef RKNPU_HAVE_CUSTOM_GOV
+ 	ret = devfreq_add_governor(&devfreq_rknpu_ondemand);
+ 	if (ret) {
+ 		LOG_DEV_ERROR(dev, "failed to add rknpu_ondemand governor: %d\n",
+ 			      ret);
+ 		return ret;
+ 	}
++#endif
+
+ 	rknpu_dev->devfreq = devm_devfreq_add_device(dev, dp,
++#ifdef RKNPU_HAVE_CUSTOM_GOV
+ 						      "rknpu_ondemand",
++#else
++						      "simple_ondemand",
++#endif
+ 						      (void *)rknpu_dev);
+ 	if (IS_ERR(rknpu_dev->devfreq)) {
+ 		LOG_DEV_ERROR(dev, "failed to add devfreq device\n");
+@@ -233,15 +244,19 @@
+ 	return 0;
+
+ err_remove_governor:
++#ifdef RKNPU_HAVE_CUSTOM_GOV
+ 	devfreq_remove_governor(&devfreq_rknpu_ondemand);
++#endif
+ 	return ret;
+ }
+ EXPORT_SYMBOL(rknpu_devfreq_init);
+
+ void rknpu_devfreq_remove(struct rknpu_device *rknpu_dev)
+ {
++#ifdef RKNPU_HAVE_CUSTOM_GOV
+ 	if (rknpu_dev->devfreq)
+ 		devfreq_remove_governor(&devfreq_rknpu_ondemand);
++#endif
+ }
+ EXPORT_SYMBOL(rknpu_devfreq_remove);

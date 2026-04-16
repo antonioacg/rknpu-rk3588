@@ -1,0 +1,146 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Device Tree Overlay for RK3588/RK3588S RKNPU (vendor driver)
+ *
+ * STATUS: Testing on Armbian 6.18.22 (Orange Pi 5 Pro).
+ *
+ * Converts mainline Rocket NPU nodes into a vendor RKNPU node for
+ * rknpu.ko (w568w/rknpu-module). Patches rknn_core_0 in place,
+ * deletes cores 1/2 and all IOMMU nodes so their IRQ/reg mappings
+ * are released (disabling alone still reserves them in DT).
+ *
+ * Apply via offline fdtoverlay merge into the boot DTB — runtime
+ * configfs application is unsafe because the mainline Rocket driver
+ * binds at boot and modifying live nodes triggers a kernel oops.
+ */
+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/clock/rockchip,rk3588-cru.h>
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/power/rk3588-power.h>
+#include <dt-bindings/reset/rockchip,rk3588-cru.h>
+
+#ifndef SCMI_CLK_NPU
+#define SCMI_CLK_NPU 6
+#endif
+
+/*
+ * NOTE: The mainline Rocket driver binds to five sibling nodes that
+ * must be removed before the vendor RKNPU driver probes:
+ *   /npu@fdac0000     (rknn_core_1)
+ *   /npu@fdad0000     (rknn_core_2)
+ *   /iommu@fdab9000   (rknn_mmu_0)
+ *   /iommu@fdaca000   (rknn_mmu_1)
+ *   /iommu@fdada000   (rknn_mmu_2)
+ *
+ * DTC emits `/delete-node/` inside a fragment as a no-op in the
+ * resulting .dtbo (fdtoverlay does not apply node deletions from
+ * overlay fragments), so we remove them out-of-band via `fdtput -r`
+ * in scripts/apply-overlay.sh after the fdtoverlay merge.
+ */
+
+/* OPP table for NPU devfreq */
+&{/} {
+	npu_opp_table: npu-opp-table {
+		compatible = "operating-points-v2";
+
+		opp-300000000 {
+			opp-hz = /bits/ 64 <300000000>;
+			opp-microvolt = <675000 675000 850000>;
+		};
+		opp-400000000 {
+			opp-hz = /bits/ 64 <400000000>;
+			opp-microvolt = <675000 675000 850000>;
+		};
+		opp-500000000 {
+			opp-hz = /bits/ 64 <500000000>;
+			opp-microvolt = <675000 675000 850000>;
+		};
+		opp-600000000 {
+			opp-hz = /bits/ 64 <600000000>;
+			opp-microvolt = <675000 675000 850000>;
+		};
+		opp-700000000 {
+			opp-hz = /bits/ 64 <700000000>;
+			opp-microvolt = <700000 700000 850000>;
+		};
+		opp-800000000 {
+			opp-hz = /bits/ 64 <800000000>;
+			opp-microvolt = <750000 750000 850000>;
+		};
+		opp-900000000 {
+			opp-hz = /bits/ 64 <900000000>;
+			opp-microvolt = <800000 800000 850000>;
+		};
+		opp-1000000000 {
+			opp-hz = /bits/ 64 <1000000000>;
+			opp-microvolt = <850000 850000 1000000>;
+		};
+	};
+};
+
+/*
+ * Convert rknn_core_0 (/npu@fdab0000) into the vendor RKNPU node.
+ * Override properties in place — no /delete-property/ to avoid
+ * kernel oops when the overlay is ever applied at runtime on a
+ * live driver-bound node (offline fdtoverlay is still the blessed
+ * path; this just keeps the overlay safe in both scenarios).
+ */
+&rknn_core_0 {
+	compatible = "rockchip,rk3588-rknpu";
+
+	reg = <0x0 0xfdab0000 0x0 0x10000>,
+	      <0x0 0xfdac0000 0x0 0x10000>,
+	      <0x0 0xfdad0000 0x0 0x10000>;
+
+	/*
+	 * Mainline RK3588 uses arm,gic-v3 with #interrupt-cells = 4
+	 * (the vendor BSP GIC uses 3-cell specs — do not copy verbatim).
+	 * 4th cell is PPI affinity, 0 for SPIs (all CPUs).
+	 */
+	interrupts = <GIC_SPI 110 IRQ_TYPE_LEVEL_HIGH 0>,
+	             <GIC_SPI 111 IRQ_TYPE_LEVEL_HIGH 0>,
+	             <GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH 0>;
+	interrupt-names = "npu0_irq", "npu1_irq", "npu2_irq";
+
+	clocks = <&scmi_clk SCMI_CLK_NPU>,
+	         <&cru ACLK_NPU0>,
+	         <&cru ACLK_NPU1>,
+	         <&cru ACLK_NPU2>,
+	         <&cru HCLK_NPU0>,
+	         <&cru HCLK_NPU1>,
+	         <&cru HCLK_NPU2>,
+	         <&cru PCLK_NPU_ROOT>;
+	clock-names = "scmi_clk", "aclk0", "aclk1", "aclk2",
+	              "hclk0", "hclk1", "hclk2", "pclk";
+
+	resets = <&cru SRST_A_RKNN0>,
+	         <&cru SRST_A_RKNN1>,
+	         <&cru SRST_A_RKNN2>,
+	         <&cru SRST_H_RKNN0>,
+	         <&cru SRST_H_RKNN1>,
+	         <&cru SRST_H_RKNN2>;
+	reset-names = "srst_a0", "srst_a1", "srst_a2",
+	              "srst_h0", "srst_h1", "srst_h2";
+
+	power-domains = <&power RK3588_PD_NPUTOP>,
+	                <&power RK3588_PD_NPU1>,
+	                <&power RK3588_PD_NPU2>;
+	power-domain-names = "npu0", "npu1", "npu2";
+
+	/*
+	 * Vendor driver looks for "rknpu-supply" / "mem-supply" via
+	 * devm_regulator_get_optional(dev, "rknpu"/"mem").
+	 * Both map to vdd_npu_s0 on the Orange Pi 5 Pro (same regulator
+	 * the mainline DT labelled "npu-supply" / "sram-supply").
+	 */
+	rknpu-supply = <&vdd_npu_s0>;
+	mem-supply = <&vdd_npu_s0>;
+
+	operating-points-v2 = <&npu_opp_table>;
+
+	status = "okay";
+};
