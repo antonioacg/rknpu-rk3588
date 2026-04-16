@@ -633,19 +633,20 @@ what a downstream consumer actually sees.
 ## Next steps
 
 1. Upstream `patches/0001-devfreq-governor-conditional.patch` to
-   w568w/rknpu-module so the carry becomes temporary. See issue #2 for
+   w568w/rknpu-module so the carry becomes temporary. See
+   [issue #2](https://github.com/antonioacg/rknpu-rk3588/issues/2) for
    the pre-upstream review checklist (security + memory audit).
-3. Restore NPU frequency scaling (see Known Issues). Either feed
+2. Restore NPU frequency scaling (see Known Issues). Either feed
    `simple_ondemand` a proper busy/total signal from the driver, or port
    parts of `rockchip_system_monitor` to rebuild the vendor's custom
    `rknpu_ondemand` governor. 3–5× throughput headroom is currently
    locked behind this.
-4. Investigate the devfreq userspace-write hang (see Known Issues). Low
+3. Investigate the devfreq userspace-write hang (see Known Issues). Low
    priority if the default governor stays stable — no consumer we care
    about writes to devfreq from userspace.
-5. Optional: wire a working IOMMU node and re-enable `iommus` on the
+4. Optional: wire a working IOMMU node and re-enable `iommus` on the
    combined node (IOMMU v2 has the `dead000000000122` bug history — test
    incrementally with `cma=128M` fallback first).
-6. Evaluate whether the OPP table needs a 200 MHz entry (driver's initial
+5. Evaluate whether the OPP table needs a 200 MHz entry (driver's initial
    frequency is lower than the table's current min of 300 MHz; likely why
    the NPU starts at 200 MHz and can't scale down further).
