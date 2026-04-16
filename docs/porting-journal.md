@@ -632,21 +632,55 @@ what a downstream consumer actually sees.
 
 ## Next steps
 
+Milestones + issues on GitHub are the canonical tracker — see the
+[roadmap](https://github.com/antonioacg/rknpu-rk3588/milestones). This
+list is prose commentary on top so the journal reads as a self-contained
+narrative.
+
+### v0.2.0 — Upstream patches + IOMMU re-enable
+
 1. Upstream `patches/0001-devfreq-governor-conditional.patch` to
    w568w/rknpu-module so the carry becomes temporary. See
    [issue #2](https://github.com/antonioacg/rknpu-rk3588/issues/2) for
    the pre-upstream review checklist (security + memory audit).
-2. Restore NPU frequency scaling (see Known Issues). Either feed
-   `simple_ondemand` a proper busy/total signal from the driver, or port
-   parts of `rockchip_system_monitor` to rebuild the vendor's custom
-   `rknpu_ondemand` governor. 3–5× throughput headroom is currently
-   locked behind this.
-3. Investigate the devfreq userspace-write hang (see Known Issues). Low
-   priority if the default governor stays stable — no consumer we care
-   about writes to devfreq from userspace.
-4. Optional: wire a working IOMMU node and re-enable `iommus` on the
-   combined node (IOMMU v2 has the `dead000000000122` bug history — test
-   incrementally with `cma=128M` fallback first).
-5. Evaluate whether the OPP table needs a 200 MHz entry (driver's initial
-   frequency is lower than the table's current min of 300 MHz; likely why
-   the NPU starts at 200 MHz and can't scale down further).
+2. Wire a working IOMMU node and re-enable `iommus` on the combined
+   node. See [issue #3](https://github.com/antonioacg/rknpu-rk3588/issues/3)
+   for the detailed plan — current disabled state is driven both by a
+   self-caused dangling-phandle workaround and by the inherited
+   hypothesis of a `dead000000000122` DMA32 page-table bug (untested
+   by us); test incrementally with `cma=128M@0-4G` as a safety net.
+3. Document CMA sizing for LLM workloads (`cma=2G+` needed because
+   non-IOMMU mode forces contiguous DMA allocations) and add a
+   `check-hardware.sh` warning so consumers hit guidance before
+   hitting EINVAL. See
+   [issue #4](https://github.com/antonioacg/rknpu-rk3588/issues/4).
+   Becomes a historical note once #3 lands.
+
+### v0.3.0 — Frequency scaling restored
+
+4. Restore NPU frequency scaling (see Known Issues). Either feed
+   `simple_ondemand` a proper busy/total signal from the driver, or
+   port parts of `rockchip_system_monitor` to rebuild the vendor's
+   custom `rknpu_ondemand` governor. 3–5× throughput headroom is
+   currently locked behind this. No issue filed yet — tracked at the
+   milestone level until the approach is decided.
+
+### v0.4.0 — Unprivileged NPU in Kubernetes pods
+
+5. Port the CDI device plugin pattern from
+   [schwankner/talos-rk3588-npu](https://github.com/schwankner/talos-rk3588-npu)
+   to k3s-on-Armbian so pods can use `/dev/dri/renderD129` with
+   `hostUsers: false` and `procMount: Unmasked` instead of
+   `privileged: true`. See
+   [docs/talos-packaging.md](talos-packaging.md) for the relationship
+   to the Talos community stack. No issue filed yet.
+
+### Unscheduled
+
+6. Investigate the devfreq userspace-write hang (see Known Issues).
+   Low priority if the default governor stays stable — no consumer we
+   care about writes to devfreq from userspace.
+7. Evaluate whether the OPP table needs a 200 MHz entry (driver's
+   initial frequency is lower than the table's current min of 300 MHz;
+   likely why the NPU starts at 200 MHz and can't scale down further).
+   Worth revisiting once v0.3 scaling work is underway.
