@@ -6,6 +6,8 @@ Out-of-tree RKNPU kernel module for RK3588/RK3588S on mainline Linux 6.19+. Enab
 
 **Working on RK3588S.** Validated end-to-end on Armbian 6.18.22 (Orange Pi 5 Pro): DKMS-installed module auto-loads on boot, `/dev/dri/renderD129` appears, vendor RKNN SDK 2.3.2 drives real MobileNet inference at 123 inf/s single-core and 271 inf/s across all three cores. See [docs/porting-journal.md](docs/porting-journal.md) for the full write-up including the IRQ-cells blocker and its resolution. Pre-upstream security/memory audit tracked in [issue #2](https://github.com/antonioacg/rknpu-rk3588/issues/2).
 
+**IOMMU mode (optional) working on RK3588.** Validated on a Radxa ROCK 5B with Armbian 7.3.4: `dts/rk3588-rknpu-iommu-overlay.dts` plus `patches/0002`–`0005` give scatter-gather NPU buffers (3 GB tested with a 256 MB CMA), with 118 inf/s single-core and ~270 inf/s on three cores. See [Test 5](docs/testing.md#test-5--iommu-mode-optional) and [issue #3](https://github.com/antonioacg/rknpu-rk3588/issues/3).
+
 ## Why This Exists
 
 The RK3588 has a 6 TOPS NPU, but the vendor RKNPU driver only ships in the BSP kernel (6.1.x). Rockchip has stopped BSP kernel development — there will never be a 6.3+ BSP. Meanwhile, the mainline "Rocket" driver (merged in 6.18) is a completely different stack (Mesa/Teflon/TFLite) that cannot run RKNN models or rkllama.
@@ -117,13 +119,17 @@ rknpu-rk3588/
 ├── CLAUDE.md                        # AI assistant instructions
 ├── CONTRIBUTING.md                  # Contribution guidelines
 ├── dts/
-│   └── rk3588-rknpu-overlay.dts    # RK3588 NPU device tree overlay
+│   ├── rk3588-rknpu-overlay.dts    # RK3588 NPU device tree overlay
+│   └── rk3588-rknpu-iommu-overlay.dts
+│                                    # Same, with the combined NPU IOMMU enabled
 ├── patches/
-│   └── 0001-devfreq-governor-conditional.patch
-│                                    # Applied to ref/rknpu-module at build time
-│                                    # (candidate for upstream to w568w)
+│   ├── 0001-devfreq-governor-conditional.patch
+│   │                                # Applied to ref/rknpu-module at build time
+│   │                                # (candidate for upstream to w568w)
+│   └── 0002..0005-*.patch           # IOMMU mode on mainline (see porting journal)
 ├── tests/
-│   └── rknn_smoke.c                 # Minimal C inference test (libc + librknnrt)
+│   ├── rknn_smoke.c                 # Minimal C inference test (libc + librknnrt)
+│   └── rknpu_bigalloc.c             # Large NPU buffer allocation test (IOMMU mode)
 ├── docs/
 │   ├── hardware-reference.md       # MMIO addresses, IRQs, clocks, power domains
 │   ├── kernel-landscape.md         # Comparison of kernel options for RK3588 NPU
@@ -167,6 +173,7 @@ rknpu-rk3588/
 | rkllm-runtime | 1.2.3 | airockchip/rknn-llm |
 | Target kernel | 6.18+ | Armbian current / mainline |
 | Tested kernel | 6.18.22-current-rockchip64 | Armbian (RK3588S, this project) |
+| Tested kernel | 7.3.4-edge-rockchip64 | Armbian (RK3588, Radxa ROCK 5B; IOMMU mode too) |
 | Upstream driver tested | 6.19.3-edge-rockchip64 | Armbian (w568w, RK3566 only) |
 
 ## Related Projects

@@ -1,0 +1,260 @@
+From: rknpu-rk3588 project <noreply@example.invalid>
+Subject: [PATCH] drv: keep the NPU1/NPU2 power domains on in IOMMU mode
+
+With the combined NPU IOMMU enabled (iommus = <&rknn_mmu_0> pointing to
+a node that covers the MMU banks of the three cores), loading the
+module locks up the whole SoC.
+
+The driver core resumes the IOMMU, a PM device-link supplier of the
+NPU, in __driver_probe_device() -> pm_runtime_get_suppliers() before
+rknpu_probe() has attached and powered the NPU1/NPU2 domains. Only
+NPUTOP, the IOMMU's own domain, is on; rk_iommu_resume() ->
+rk_iommu_enable() -> rk_iommu_enable_stall() then accesses the core1
+and core2 MMU registers in powered-off domains and the bus hangs (no
+panic, the board is reset by the watchdog). Traced with the function
+tracer and rpm/clk events streamed over SSH:
+
+  rknpu_init <-do_one_initcall
+  rpm_resume: fdab9000.iommu flags-4 cnt-1 ...
+  genpd_power_on / rockchip_pd_power_on      (NPUTOP only)
+  clk_enable: aclk_npu0..2, hclk_npu0..2
+  rk_iommu_resume -> rk_iommu_enable -> rk_iommu_enable_stall   <hang>
+
+The same hazard exists on unbind (__device_release_driver() resumes
+the device and its suppliers) and for the asynchronous IOMMU runtime
+suspend after the domains are powered off.
+
+When "iommus" points to an available IOMMU, attach and power the
+"npu1" and "npu2" domains in rknpu_init() before registering the
+driver and keep them on for the module lifetime:
+- rknpu_probe() reuses these virtual devices (attaching again would
+  clash on the genpd:<index>:<dev> device names);
+- rknpu_remove() does not detach them;
+- rknpu_power_off() no longer waits for the IOMMU to suspend, which is
+  not needed with the domains held (and the IOMMU may legitimately
+  stay active during probe because of the supplier reference);
+- rknpu_exit() releases them only once the IOMMU is really suspended,
+  and keeps them on otherwise rather than risk a lockup.
+The module refuses to load if the domains cannot be held.
+
+Cost: NPU1/NPU2 stay powered while the module is loaded. No change in
+non-IOMMU mode.
+
+Tested on Radxa ROCK 5B (RK3588), Armbian 7.3.4-edge-rockchip64:
+module load at boot and by hand, inference on 1 and 3 cores,
+rmmod/modprobe cycles (all NPU domains off and the IOMMU suspended
+after rmmod).
+
+--- a/src/rknpu_drv.c
++++ b/src/rknpu_drv.c
+@@ -347,6 +347,13 @@
+ }
+ 
+ static int rknpu_power_on(struct rknpu_device *rknpu_dev);
++
++/*
++ * NPU1/NPU2 power domain virtual devices held on for the module lifetime
++ * in IOMMU mode (see rknpu_hold_power_domains()). [0] = npu1, [1] = npu2.
++ */
++static struct device *rknpu_pd_hold[2];
++static struct device *rknpu_pd_iommu;
+ static int rknpu_power_off(struct rknpu_device *rknpu_dev);
+ 
+ static void rknpu_power_off_delay_work(struct work_struct *power_off_work)
+@@ -1063,9 +1070,18 @@
+ 		 * If pm runtime framework can handle this issue in the future, remove
+ 		 * this.
+ 		 */
+-		ret = readx_poll_timeout(rockchip_iommu_is_enabled, dev, val,
+-					 !val, NPU_MMU_DISABLED_POLL_PERIOD_US,
+-					 NPU_MMU_DISABLED_POLL_TIMEOUT_US);
++		/*
++		 * With NPU1/NPU2 held on, the asynchronous IOMMU suspend
++		 * can never hit a powered-off domain, and the IOMMU may stay
++		 * active anyway (driver core supplier reference during probe).
++		 */
++		if (rknpu_pd_hold[0] || rknpu_pd_hold[1])
++			ret = 0;
++		else
++			ret = readx_poll_timeout(rockchip_iommu_is_enabled, dev,
++						 val, !val,
++						 NPU_MMU_DISABLED_POLL_PERIOD_US,
++						 NPU_MMU_DISABLED_POLL_TIMEOUT_US);
+ 		if (ret) {
+ 			LOG_DEV_ERROR(dev, "iommu still enabled\n");
+ 			pm_runtime_get_sync(dev);
+@@ -1479,11 +1495,19 @@
+ 		virt_dev = dev_pm_domain_attach_by_name(dev, "npu0");
+ 		if (!IS_ERR(virt_dev))
+ 			rknpu_dev->genpd_dev_npu0 = virt_dev;
+-		virt_dev = dev_pm_domain_attach_by_name(dev, "npu1");
++		/* Reuse the virtual devices held by rknpu_init() */
++		if (rknpu_pd_hold[0])
++			virt_dev = rknpu_pd_hold[0];
++		else
++			virt_dev = dev_pm_domain_attach_by_name(dev, "npu1");
+ 		if (!IS_ERR(virt_dev))
+ 			rknpu_dev->genpd_dev_npu1 = virt_dev;
+ 		if (config->num_irqs > 2) {
+-			virt_dev = dev_pm_domain_attach_by_name(dev, "npu2");
++			if (rknpu_pd_hold[1])
++				virt_dev = rknpu_pd_hold[1];
++			else
++				virt_dev = dev_pm_domain_attach_by_name(dev,
++									"npu2");
+ 			if (!IS_ERR(virt_dev))
+ 				rknpu_dev->genpd_dev_npu2 = virt_dev;
+ 		}
+@@ -1614,9 +1638,12 @@
+ 	if (rknpu_dev->multiple_domains) {
+ 		if (rknpu_dev->genpd_dev_npu0)
+ 			dev_pm_domain_detach(rknpu_dev->genpd_dev_npu0, true);
+-		if (rknpu_dev->genpd_dev_npu1)
++		/* Held domains are released by rknpu_exit() */
++		if (rknpu_dev->genpd_dev_npu1 &&
++		    rknpu_dev->genpd_dev_npu1 != rknpu_pd_hold[0])
+ 			dev_pm_domain_detach(rknpu_dev->genpd_dev_npu1, true);
+-		if (rknpu_dev->genpd_dev_npu2)
++		if (rknpu_dev->genpd_dev_npu2 &&
++		    rknpu_dev->genpd_dev_npu2 != rknpu_pd_hold[1])
+ 			dev_pm_domain_detach(rknpu_dev->genpd_dev_npu2, true);
+ 	}
+ 
+@@ -1673,14 +1700,136 @@
+ 	},
+ };
+ 
++/*
++ * Mainline, combined NPU IOMMU: keep the NPU1/NPU2 power domains on for
++ * the whole module lifetime. The driver core resumes the IOMMU, a PM
++ * device-link supplier of the NPU, in __driver_probe_device() ->
++ * pm_runtime_get_suppliers() before rknpu_probe() has powered NPU1/NPU2;
++ * rk_iommu_resume() -> rk_iommu_enable() then accesses the core1/core2 MMU
++ * registers in powered-off domains and the bus locks up (traced on 7.3.4).
++ * The same applies to unbind and to the asynchronous IOMMU runtime suspend.
++ * Only done when "iommus" points to an available IOMMU; refuse to load if the
++ * domains cannot be held, rather than hang the machine. rknpu_probe() reuses
++ * these virtual devices (the genpd:<index>:<dev> names would clash).
++ */
++static void rknpu_release_power_domains(void)
++{
++	int i, wait_ms;
++
++	/*
++	 * The IOMMU runtime suspend (rk_iommu_disable(), touching every MMU
++	 * bank) is asynchronous: only power NPU1/NPU2 off once it is done.
++	 * If it does not suspend, keep the domains on rather than risk a bus
++	 * lockup.
++	 */
++	if (rknpu_pd_iommu) {
++		for (wait_ms = 0; wait_ms < 2000; wait_ms += 10) {
++			pm_runtime_barrier(rknpu_pd_iommu);
++			if (pm_runtime_status_suspended(rknpu_pd_iommu))
++				break;
++			msleep(10);
++		}
++		if (!pm_runtime_status_suspended(rknpu_pd_iommu)) {
++			pr_err("RKNPU: iommu still active, keeping npu1/npu2 powered\n");
++			return;
++		}
++		put_device(rknpu_pd_iommu);
++		rknpu_pd_iommu = NULL;
++	}
++
++	for (i = ARRAY_SIZE(rknpu_pd_hold) - 1; i >= 0; i--) {
++		if (!rknpu_pd_hold[i])
++			continue;
++		pm_runtime_put_sync(rknpu_pd_hold[i]);
++		dev_pm_domain_detach(rknpu_pd_hold[i], true);
++		rknpu_pd_hold[i] = NULL;
++	}
++}
++
++static int rknpu_hold_power_domains(void)
++{
++	static const char *const names[] = { "npu1", "npu2" };
++	struct device_node *np, *iommu;
++	struct platform_device *pdev;
++	bool iommu_on;
++	int i, ret = 0;
++
++	np = of_find_compatible_node(NULL, NULL, "rockchip,rk3588-rknpu");
++	if (!np)
++		return 0;
++
++	iommu = of_parse_phandle(np, "iommus", 0);
++	iommu_on = iommu && of_device_is_available(iommu);
++	if (iommu_on) {
++		struct platform_device *ipdev = of_find_device_by_node(iommu);
++
++		if (ipdev)
++			rknpu_pd_iommu = &ipdev->dev;
++		else
++			iommu_on = false;
++	}
++	of_node_put(iommu);
++	if (!iommu_on) {
++		of_node_put(np);
++		return 0;
++	}
++
++	pdev = of_find_device_by_node(np);
++	of_node_put(np);
++	if (!pdev)
++		return -ENODEV;
++
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		struct device *vd;
++
++		vd = dev_pm_domain_attach_by_name(&pdev->dev, names[i]);
++		if (IS_ERR_OR_NULL(vd)) {
++			ret = vd ? PTR_ERR(vd) : -ENODEV;
++			pr_err("RKNPU: cannot attach power domain %s: %d\n",
++			       names[i], ret);
++			break;
++		}
++
++		ret = pm_runtime_resume_and_get(vd);
++		if (ret < 0) {
++			pr_err("RKNPU: cannot power on domain %s: %d\n",
++			       names[i], ret);
++			dev_pm_domain_detach(vd, true);
++			break;
++		}
++		rknpu_pd_hold[i] = vd;
++		ret = 0;
++	}
++	put_device(&pdev->dev);
++
++	if (ret) {
++		rknpu_release_power_domains();
++		return ret;
++	}
++
++	pr_info("RKNPU: npu1/npu2 power domains held on (iommu mode)\n");
++	return 0;
++}
++
+ static int rknpu_init(void)
+ {
+-	return platform_driver_register(&rknpu_driver);
++	int ret;
++
++	ret = rknpu_hold_power_domains();
++	if (ret)
++		return ret;
++
++	ret = platform_driver_register(&rknpu_driver);
++	if (ret)
++		rknpu_release_power_domains();
++
++	return ret;
+ }
+ 
+ static void rknpu_exit(void)
+ {
+ 	platform_driver_unregister(&rknpu_driver);
++	rknpu_release_power_domains();
+ }
+ 
+ late_initcall(rknpu_init);

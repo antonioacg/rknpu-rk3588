@@ -1,0 +1,65 @@
+From: rknpu-rk3588 project <noreply@example.invalid>
+Subject: [PATCH] gem: fix the non-contiguous fallback of contiguous allocations with the IOMMU
+
+When a RKNPU_MEM_CONTIGUOUS allocation fails with the IOMMU enabled
+(typically larger than what is left in CMA), rknpu_gem_alloc_buf()
+falls back to a non-contiguous buffer: it sets RKNPU_MEM_NON_CONTIGUOUS
+but still allocates it with dma_alloc_attrs(). With the IOMMU, objects
+flagged RKNPU_MEM_NON_CONTIGUOUS are mmapped and freed through the
+shmem page path (rknpu_gem_mmap_pages(), rknpu_gem_put_pages()), so the
+fallback object is inconsistent:
+
+  RKNPU: try to fallback to allocate non-contiguous 268435456 buffer.
+  RKNPU: failed to map pages into vma: -6
+  refcount_t: underflow; use-after-free.
+  WARNING: lib/refcount.c:28 at refcount_warn_saturate+0xf4/0x148
+
+Use rknpu_gem_get_pages() for the fallback too, after freeing the page
+array allocated for the contiguous attempt. Also pass __GFP_NOWARN to
+the contiguous attempt when the IOMMU is enabled: its failure is
+expected and handled, and otherwise triggers a page allocator warning
+for the huge order.
+
+Tested on Radxa ROCK 5B (RK3588), Armbian 7.3.4-edge-rockchip64, CMA
+256 MB: 256 MB + 512 MB + 1 GB contiguous requests are served through
+the fallback, mapped, written and read back, without any warning.
+
+--- a/src/rknpu_gem.c
++++ b/src/rknpu_gem.c
+@@ -191,6 +191,15 @@
+ 	if (rknpu_obj->flags & RKNPU_MEM_ZEROING)
+ 		gfp_mask |= __GFP_ZERO;
+ 
++	/*
++	 * With the IOMMU, a failed physically contiguous allocation is
++	 * expected (CMA too small) and handled by the fallback below; do not
++	 * let the page allocator warn about the huge order.
++	 */
++	if (rknpu_dev->iommu_en &&
++	    !(rknpu_obj->flags & RKNPU_MEM_NON_CONTIGUOUS))
++		gfp_mask |= __GFP_NOWARN;
++
+ 	if (!rknpu_dev->iommu_en ||
+ 	    rknpu_dev->config->dma_mask <= DMA_BIT_MASK(32) ||
+ 	    (rknpu_obj->flags & RKNPU_MEM_DMA32)) {
+@@ -222,6 +231,20 @@
+ 				rknpu_obj->size);
+ 			rknpu_obj->dma_attrs &= ~DMA_ATTR_FORCE_CONTIGUOUS;
+ 			rknpu_obj->flags |= RKNPU_MEM_NON_CONTIGUOUS;
++#if RKNPU_GEM_ALLOC_FROM_PAGES
++			/*
++			 * With the IOMMU, RKNPU_MEM_NON_CONTIGUOUS objects
++			 * are mmapped and freed through the shmem page path
++			 * (rknpu_gem_mmap_pages(), rknpu_gem_put_pages()).
++			 * Allocating the fallback with dma_alloc_attrs() made
++			 * mmap fail (-ENXIO) and the free path put pages it did
++			 * not own (refcount underflow, use-after-free). Use the
++			 * page path for the fallback too.
++			 */
++			rknpu_gem_free_page(rknpu_obj->pages);
++			rknpu_obj->pages = NULL;
++			return rknpu_gem_get_pages(rknpu_obj);
++#endif
+ 			rknpu_obj->cookie = dma_alloc_attrs(
+ 				drm->dev, rknpu_obj->size, &rknpu_obj->dma_addr,
+ 				gfp_mask, rknpu_obj->dma_attrs);

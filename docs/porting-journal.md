@@ -630,6 +630,134 @@ applies `patches/*.patch`, and registers with DKMS. Verified on Armbian
 This makes the clone-run-reboot-still-works experience hold, which is
 what a downstream consumer actually sees.
 
+## 2026-11-25 — IOMMU re-enabled (Radxa ROCK 5B, kernel 7.3.4)
+
+Board: Radxa ROCK 5B (RK3588, 16 GB), Armbian `7.3.4-edge-rockchip64`,
+mainline U-Boot + TF-A. Tracks
+[issue #3](https://github.com/antonioacg/rknpu-rk3588/issues/3).
+
+### Baseline: non-IOMMU mode also works on RK3588 / 7.3.4
+
+The module builds unchanged against 7.3.4 headers (with `0001`), and
+MobileNet runs at 123 inf/s single-core. On this board the overlay was
+applied as an Armbian user overlay (`/boot/overlay-user/*.dtbo` +
+`user_overlays=` in `armbianEnv.txt`) with the Rocket sibling nodes
+**disabled** (`status = "disabled"`) instead of deleted: disabled nodes
+get no platform device and claim no IRQ or MMIO. The earlier hypothesis
+that disabled nodes keep SPI 111/112 reserved predates the real cause
+(3-cell interrupt specifiers), so `fdtput -r` is not required. U-Boot
+falls back to the original DT if applying an overlay fails, which makes
+this path safer on boards without a serial console.
+
+### Combined IOMMU node
+
+`dts/rk3588-rknpu-iommu-overlay.dts` keeps `iommus = <&rknn_mmu_0>` on
+the combined NPU node and extends `rknn_mmu_0` to the MMU banks of the
+three cores, like the BSP `rknpu_mmu` node: `reg` = `fdab9000`,
+`fdaba000`, `fdaca000`, `fdada000`; `interrupts` = SPI 110/111/112
+(shared with the NPU, both sides use `IRQF_SHARED`). Checked in the
+7.3 `drivers/iommu/rockchip-iommu.c`: several banks and IRQs per node
+are supported, and clocks are taken with `devm_clk_bulk_get_all()`, so
+the node lists the aclk/hclk of the three cores. At boot the node binds
+to `rk_iommu` without issue.
+
+### Patch 0002: `rockchip_iommu_is_enabled()` stub always true
+
+`rknpu_power_off()` polls it before powering NPU1/NPU2 down (the IOMMU
+runtime suspend is asynchronous and touches every bank). The compat stub
+returned true whenever an IOMMU group existed, so every power-off would
+time out with `iommu still enabled`. It now reports the real runtime PM
+state of the IOMMU device.
+
+### Patch 0004: loading the module hard-locks the SoC
+
+The first `modprobe rknpu` in IOMMU mode froze the board (no panic, no
+kdump vmcore, reset by the hardware watchdog; the on-disk journal lost
+the last seconds). Second attempt with the function tracer
+(`rk_iommu_*`, `rockchip_pd_power*`, `genpd_power_*`, `:mod:rknpu`) and
+`rpm`/`clk`/`regulator`/`irq` events, `trace_pipe` and `dmesg -W`
+streamed live over SSH:
+
+```
+rknpu_init <-do_one_initcall
+rpm_resume: fdab9000.iommu flags-4 cnt-1  dep-0  auto-1 p-0 irq-0 child-0
+genpd_power_on <-genpd_runtime_resume
+rockchip_pd_power_on <-_genpd_power_on          (NPUTOP only)
+clk_enable: aclk_npu0 / hclk_npu0 / aclk_npu1 / hclk_npu1 / aclk_npu2 / hclk_npu2
+rk_iommu_resume <-pm_generic_runtime_resume
+rk_iommu_enable <-rk_iommu_resume
+rk_iommu_enable_stall <-rk_iommu_enable
+<board frozen>
+```
+
+The driver core resumes the IOMMU — a PM device-link supplier of the
+NPU — in `__driver_probe_device()` → `pm_runtime_get_suppliers()`,
+*before* `rknpu_probe()` attaches and powers NPU1/NPU2. Only NPUTOP (the
+IOMMU's own domain) is on, and the first access to the core 1/2 MMU
+banks hangs the bus. Clocks are not enough; the power domains must be
+on. Unbind and the asynchronous IOMMU suspend have the same hazard.
+
+Fix: when `iommus` points to an available IOMMU, `rknpu_init()` attaches
+and powers the `npu1`/`npu2` domains before registering the driver and
+keeps them on for the module lifetime. `rknpu_probe()` reuses those
+virtual devices (a second attach clashes on the `genpd:<index>:<dev>`
+names), `rknpu_power_off()` skips the IOMMU poll, and `rknpu_exit()`
+releases the domains only after the IOMMU is really suspended (it keeps
+them on otherwise). Cost: NPU1/NPU2 stay powered while the module is
+loaded. After `rmmod`, all NPU domains are off and the IOMMU suspended.
+
+### Patch 0003: soft reset does not reprogram the IOMMU on mainline
+
+`rknpu_soft_reset()` asserts `SRST_A/H_RKNN*`, which also reset the
+per-core MMUs, then detaches/re-attaches the current domain. On mainline
+that is a no-op (`__iommu_group_set_domain_internal()` returns early when
+the domain does not change), so paging would stay off after a reset and
+the NPU would use IOVAs as physical addresses. The patch calls the
+`rk_iommu` `runtime_resume` callback (`rk_iommu_enable()`), which
+force-resets and reprograms every bank. Verified with
+`echo 1 > /sys/kernel/debug/rknpu/reset` during a 3-core loop: the job
+in flight is aborted, `iommu reprogrammed after soft reset` is logged,
+and the next inferences run normally.
+
+### Patch 0005: use-after-free in the contiguous → non-contiguous fallback
+
+`tests/rknpu_bigalloc.c` asking for 256 MB *contiguous* with a 256 MB CMA
+showed:
+
+```
+RKNPU: try to fallback to allocate non-contiguous 268435456 buffer.
+RKNPU: failed to map pages into vma: -6
+refcount_t: underflow; use-after-free.
+```
+
+The fallback flagged the object `RKNPU_MEM_NON_CONTIGUOUS` but allocated
+it with `dma_alloc_attrs()`, while with the IOMMU such objects are
+mmapped and freed through the shmem page path. The fallback now uses
+`rknpu_gem_get_pages()`, and the contiguous attempt passes
+`__GFP_NOWARN`.
+
+### Results (SDK 2.5.0 fetched by `scripts/test-inference.sh`)
+
+- MobileNet v1: 118–120 inf/s single-core (123 without IOMMU),
+  264–275 inf/s with `CORE_MASK=0_1_2`.
+- `tests/rknpu_bigalloc.c`: 1.5 GB + 1 GB + 512 MB non-contiguous at the
+  same time (3 GB) and 256 MB + 512 MB + 1 GB "contiguous" (served by
+  the fallback), all written and read back, CMA untouched.
+- Soft reset during inference, `rmmod`/`modprobe` cycles, and auto-load
+  at boot (`/etc/modules-load.d/rknpu.conf`, 7.3 s after kernel start):
+  no warning.
+- The `dead000000000122` DMA32 page-table concern was not observed with
+  16 GB of RAM: the 7.3 driver uses 40-bit page table addresses for
+  `rockchip,rk3568-iommu` (`iommu_data_ops_v2`).
+
+### Remaining limits
+
+- One IOMMU domain only (the vendor multi-domain code needs
+  `CONFIG_NO_GKI`): about 4 GB of NPU address space in total, and the
+  IOVA allocator aligns a block on its size rounded up to a power of
+  two (a 1.5 GB buffer needs a free 2 GB-aligned slot).
+- Not tested on RK3588S / Orange Pi 5 Pro, nor on 6.18/6.19.
+
 ## Next steps
 
 Milestones + issues on GitHub are the canonical tracker — see the
@@ -643,18 +771,18 @@ narrative.
    w568w/rknpu-module so the carry becomes temporary. See
    [issue #2](https://github.com/antonioacg/rknpu-rk3588/issues/2) for
    the pre-upstream review checklist (security + memory audit).
-2. Wire a working IOMMU node and re-enable `iommus` on the combined
-   node. See [issue #3](https://github.com/antonioacg/rknpu-rk3588/issues/3)
-   for the detailed plan — current disabled state is driven both by a
-   self-caused dangling-phandle workaround and by the inherited
-   hypothesis of a `dead000000000122` DMA32 page-table bug (untested
-   by us); test incrementally with `cma=128M@0-4G` as a safety net.
+2. ~~Wire a working IOMMU node and re-enable `iommus` on the combined
+   node.~~ Done on RK3588 / 7.3.4 with `dts/rk3588-rknpu-iommu-overlay.dts`
+   and `patches/0002`..`0005`, see "IOMMU re-enabled" above and
+   [issue #3](https://github.com/antonioacg/rknpu-rk3588/issues/3).
+   Still to validate on RK3588S (Orange Pi 5 Pro) and 6.18/6.19, and
+   with a 1M-iteration soak.
 3. Document CMA sizing for LLM workloads (`cma=2G+` needed because
    non-IOMMU mode forces contiguous DMA allocations) and add a
    `check-hardware.sh` warning so consumers hit guidance before
    hitting EINVAL. See
    [issue #4](https://github.com/antonioacg/rknpu-rk3588/issues/4).
-   Becomes a historical note once #3 lands.
+   Only needed for the non-IOMMU overlay once IOMMU mode is validated.
 
 ### v0.3.0 — Frequency scaling restored
 

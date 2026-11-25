@@ -1,0 +1,173 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Device Tree Overlay for RK3588/RK3588S RKNPU (vendor driver), IOMMU mode
+ *
+ * STATUS: Tested on Armbian 7.3.4-edge-rockchip64 (Radxa ROCK 5B, RK3588).
+ *         Requires patches/0002..0005 (0004 in particular: without it,
+ *         loading the module locks up the SoC). See issue #3 and
+ *         docs/porting-journal.md "IOMMU re-enabled".
+ *
+ * Same combined rknn_core_0 node as dts/rk3588-rknpu-overlay.dts, plus:
+ *  - rknn_mmu_0 is extended to the MMU banks of the three cores
+ *    (combined IOMMU, modelled on the vendor BSP "rknpu_mmu" node) and
+ *    enabled; rknn_core_0 already has iommus = <&rknn_mmu_0>;
+ *  - the other Rocket nodes are DISABLED instead of deleted. Disabled
+ *    nodes get no platform device, so they claim no IRQ or MMIO (the
+ *    earlier IRQ failure was the 3-cell interrupt specifier, see the
+ *    porting journal). As nothing has to be deleted, this overlay can
+ *    be applied as is, either by U-Boot at boot (Armbian user_overlays,
+ *    which falls back to the original DT if applying fails) or by
+ *    scripts/apply-overlay.sh with IOMMU=1 (no fdtput stripping).
+ *
+ * Never apply at runtime (configfs): the mainline Rocket driver binds
+ * at boot and modifying live nodes triggers a kernel oops.
+ */
+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/clock/rockchip,rk3588-cru.h>
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/power/rk3588-power.h>
+#include <dt-bindings/reset/rockchip,rk3588-cru.h>
+
+#ifndef SCMI_CLK_NPU
+#define SCMI_CLK_NPU 6
+#endif
+
+
+/* OPP table for NPU devfreq */
+&{/} {
+	npu_opp_table: npu-opp-table {
+		compatible = "operating-points-v2";
+
+		opp-300000000 {
+			opp-hz = /bits/ 64 <300000000>;
+			opp-microvolt = <675000 675000 850000>;
+		};
+		opp-400000000 {
+			opp-hz = /bits/ 64 <400000000>;
+			opp-microvolt = <675000 675000 850000>;
+		};
+		opp-500000000 {
+			opp-hz = /bits/ 64 <500000000>;
+			opp-microvolt = <675000 675000 850000>;
+		};
+		opp-600000000 {
+			opp-hz = /bits/ 64 <600000000>;
+			opp-microvolt = <675000 675000 850000>;
+		};
+		opp-700000000 {
+			opp-hz = /bits/ 64 <700000000>;
+			opp-microvolt = <700000 700000 850000>;
+		};
+		opp-800000000 {
+			opp-hz = /bits/ 64 <800000000>;
+			opp-microvolt = <750000 750000 850000>;
+		};
+		opp-900000000 {
+			opp-hz = /bits/ 64 <900000000>;
+			opp-microvolt = <800000 800000 850000>;
+		};
+		opp-1000000000 {
+			opp-hz = /bits/ 64 <1000000000>;
+			opp-microvolt = <850000 850000 1000000>;
+		};
+	};
+};
+
+/*
+ * Convert rknn_core_0 (/npu@fdab0000) into the vendor RKNPU node.
+ * Override properties in place — no /delete-property/ to avoid
+ * kernel oops when the overlay is ever applied at runtime on a
+ * live driver-bound node (offline fdtoverlay is still the blessed
+ * path; this just keeps the overlay safe in both scenarios).
+ */
+&rknn_core_0 {
+	compatible = "rockchip,rk3588-rknpu";
+
+	reg = <0x0 0xfdab0000 0x0 0x10000>,
+	      <0x0 0xfdac0000 0x0 0x10000>,
+	      <0x0 0xfdad0000 0x0 0x10000>;
+
+	/*
+	 * Mainline RK3588 uses arm,gic-v3 with #interrupt-cells = 4
+	 * (the vendor BSP GIC uses 3-cell specs — do not copy verbatim).
+	 * 4th cell is PPI affinity, 0 for SPIs (all CPUs).
+	 */
+	interrupts = <GIC_SPI 110 IRQ_TYPE_LEVEL_HIGH 0>,
+	             <GIC_SPI 111 IRQ_TYPE_LEVEL_HIGH 0>,
+	             <GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH 0>;
+	interrupt-names = "npu0_irq", "npu1_irq", "npu2_irq";
+
+	clocks = <&scmi_clk SCMI_CLK_NPU>,
+	         <&cru ACLK_NPU0>,
+	         <&cru ACLK_NPU1>,
+	         <&cru ACLK_NPU2>,
+	         <&cru HCLK_NPU0>,
+	         <&cru HCLK_NPU1>,
+	         <&cru HCLK_NPU2>,
+	         <&cru PCLK_NPU_ROOT>;
+	clock-names = "scmi_clk", "aclk0", "aclk1", "aclk2",
+	              "hclk0", "hclk1", "hclk2", "pclk";
+
+	resets = <&cru SRST_A_RKNN0>,
+	         <&cru SRST_A_RKNN1>,
+	         <&cru SRST_A_RKNN2>,
+	         <&cru SRST_H_RKNN0>,
+	         <&cru SRST_H_RKNN1>,
+	         <&cru SRST_H_RKNN2>;
+	reset-names = "srst_a0", "srst_a1", "srst_a2",
+	              "srst_h0", "srst_h1", "srst_h2";
+
+	power-domains = <&power RK3588_PD_NPUTOP>,
+	                <&power RK3588_PD_NPU1>,
+	                <&power RK3588_PD_NPU2>;
+	power-domain-names = "npu0", "npu1", "npu2";
+
+	/*
+	 * Vendor driver looks for "rknpu-supply" / "mem-supply" via
+	 * devm_regulator_get_optional(dev, "rknpu"/"mem").
+	 * Both map to vdd_npu_s0 on the Orange Pi 5 Pro (same regulator
+	 * the mainline DT labelled "npu-supply" / "sram-supply").
+	 */
+	rknpu-supply = <&vdd_npu_s0>;
+	mem-supply = <&vdd_npu_s0>;
+
+	operating-points-v2 = <&npu_opp_table>;
+
+	status = "okay";
+};
+
+/*
+ * Combined NPU IOMMU: the MMU banks of core 0 (a/b), core 1 and core 2,
+ * with the three NPU IRQs (shared with the NPU, IRQF_SHARED on both
+ * sides). The mainline rockchip-iommu driver handles several register
+ * banks and IRQs per node, and takes every clock of the node
+ * (devm_clk_bulk_get_all(), checked on 7.3): list the aclk/hclk of the
+ * three cores so that register writes to the core 1/2 banks land.
+ *
+ * The node stays in RK3588_PD_NPUTOP only: the NPU1/NPU2 domains of the
+ * core 1/2 banks are kept on by the driver (patches/0004).
+ */
+&rknn_mmu_0 {
+	reg = <0x0 0xfdab9000 0x0 0x100>,
+	      <0x0 0xfdaba000 0x0 0x100>,
+	      <0x0 0xfdaca000 0x0 0x100>,
+	      <0x0 0xfdada000 0x0 0x100>;
+	interrupts = <GIC_SPI 110 IRQ_TYPE_LEVEL_HIGH 0>,
+	             <GIC_SPI 111 IRQ_TYPE_LEVEL_HIGH 0>,
+	             <GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH 0>;
+	clocks = <&cru ACLK_NPU0>, <&cru HCLK_NPU0>,
+	         <&cru ACLK_NPU1>, <&cru HCLK_NPU1>,
+	         <&cru ACLK_NPU2>, <&cru HCLK_NPU2>;
+	clock-names = "aclk", "iface", "aclk1", "iface1", "aclk2", "iface2";
+	status = "okay";
+};
+
+/* Rocket nodes absorbed by the combined NPU and IOMMU nodes. */
+&rknn_core_1 { status = "disabled"; };
+&rknn_core_2 { status = "disabled"; };
+&rknn_mmu_1 { status = "disabled"; };
+&rknn_mmu_2 { status = "disabled"; };

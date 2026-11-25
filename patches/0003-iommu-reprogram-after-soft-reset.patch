@@ -1,0 +1,134 @@
+From: rknpu-rk3588 project <noreply@example.invalid>
+Subject: [PATCH] reset: reprogram the IOMMU after an NPU soft reset on mainline
+
+rknpu_soft_reset() asserts SRST_A/H_RKNN0..2, which also reset the
+per-core NPU MMUs, then relies on iommu_detach_device() +
+iommu_attach_device() on the current domain to reprogram them.
+
+On mainline this is a no-op: detaching restores the group's core
+(default) domain, which is the domain already attached, and
+__iommu_group_set_domain_internal() returns early when
+group->domain == new_domain (drivers/iommu/iommu.c, 7.3). The MMUs
+would stay with paging disabled after the reset, so the NPU would use
+its IOVAs as physical addresses.
+
+Without CONFIG_NO_GKI (i.e. on mainline), call the runtime_resume
+callback of the rk_iommu driver instead: rk_iommu_resume() ->
+rk_iommu_enable() force-resets every MMU bank and rewrites DTE_ADDR,
+zaps the cache, restores the IRQ mask and enables paging. It is only
+done while the IOMMU is runtime-active (the NPU is powered during a
+soft reset); if it is suspended, its next resume reprograms it anyway.
+
+Tested on Radxa ROCK 5B (RK3588), Armbian 7.3.4-edge-rockchip64, with
+"echo 1 > /sys/kernel/debug/rknpu/reset" during a 3-core inference
+loop: the in-flight job is aborted, "iommu reprogrammed after soft
+reset" is logged and the following inferences run normally.
+
+--- a/src/rknpu_reset.c
++++ b/src/rknpu_reset.c
+@@ -6,9 +6,71 @@
+ 
+ #include <linux/delay.h>
+ #include <linux/iommu.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/string.h>
+ 
+ #include "rknpu_reset.h"
+ 
++#if !defined(FPGA_PLATFORM) && !defined(CONFIG_NO_GKI)
++/*
++ * Mainline: the vendor iommu_detach_device() + iommu_attach_device() dance on
++ * the same (default DMA) domain is a no-op (__iommu_group_set_domain_internal()
++ * returns early when group->domain == new_domain), so the per-core MMUs wiped
++ * by SRST_A/H_RKNN* would stay unprogrammed (paging off: the NPU would then
++ * use IOVAs as physical addresses). Re-run the rk_iommu runtime resume
++ * callback, i.e. rk_iommu_enable(): force reset, DTE_ADDR, zap cache, IRQ
++ * mask, paging. Only while the IOMMU is runtime-active; if it is suspended,
++ * its next resume reprograms it anyway.
++ */
++static int rknpu_iommu_reenable(struct rknpu_device *rknpu_dev)
++{
++	struct device *dev = rknpu_dev->dev;
++	const struct dev_pm_ops *pm;
++	struct platform_device *pdev;
++	struct device_node *np;
++	int ret;
++
++	np = of_parse_phandle(dev->of_node, "iommus", 0);
++	if (!np)
++		return -ENODEV;
++
++	pdev = of_find_device_by_node(np);
++	of_node_put(np);
++	if (!pdev)
++		return -ENODEV;
++
++	if (!pdev->dev.driver || strcmp(pdev->dev.driver->name, "rk_iommu")) {
++		ret = -ENODEV;
++		goto out;
++	}
++
++	pm = pdev->dev.driver->pm;
++	if (!pm || !pm->runtime_resume) {
++		ret = -ENODEV;
++		goto out;
++	}
++
++	ret = pm_runtime_get_if_in_use(&pdev->dev);
++	if (ret <= 0) {
++		/* suspended: reprogrammed at next resume */
++		ret = 0;
++		goto out;
++	}
++
++	ret = pm->runtime_resume(&pdev->dev);
++	pm_runtime_put(&pdev->dev);
++	if (!ret)
++		LOG_INFO("iommu reprogrammed after soft reset\n");
++
++out:
++	put_device(&pdev->dev);
++	return ret;
++}
++#endif
++
+ #ifndef FPGA_PLATFORM
+ static inline struct reset_control *rknpu_reset_control_get(struct device *dev,
+ 							    const char *name)
+@@ -98,7 +160,7 @@
+ int rknpu_soft_reset(struct rknpu_device *rknpu_dev)
+ {
+ #ifndef FPGA_PLATFORM
+-	struct iommu_domain *domain = NULL;
++	struct iommu_domain *domain __maybe_unused = NULL;
+ 	struct rknpu_subcore_data *subcore_data = NULL;
+ 	int ret = 0, i = 0;
+ 
+@@ -138,6 +200,7 @@
+ 		return ret;
+ 	}
+ 
++#ifdef CONFIG_NO_GKI
+ 	if (rknpu_dev->iommu_en)
+ 		domain = iommu_get_domain_for_dev(rknpu_dev->dev);
+ 
+@@ -145,6 +208,16 @@
+ 		iommu_detach_device(domain, rknpu_dev->dev);
+ 		iommu_attach_device(domain, rknpu_dev->dev);
+ 	}
++#else
++	if (rknpu_dev->iommu_en) {
++		int err = rknpu_iommu_reenable(rknpu_dev);
++
++		if (err)
++			LOG_DEV_ERROR(rknpu_dev->dev,
++				      "failed to reprogram iommu after soft reset: %d\n",
++				      err);
++	}
++#endif
+ 
+ 	rknpu_dev->soft_reseting = false;
+ 

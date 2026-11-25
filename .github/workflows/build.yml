@@ -39,12 +39,17 @@ jobs:
           cpp -nostdinc -Iinclude -undef -x assembler-with-cpp \
             dts/rk3588-rknpu-overlay.dts -o rk3588-rknpu-overlay.preprocessed.dts
           dtc -@ -I dts -O dtb -o rk3588-rknpu.dtbo rk3588-rknpu-overlay.preprocessed.dts
+          cpp -nostdinc -Iinclude -undef -x assembler-with-cpp \
+            dts/rk3588-rknpu-iommu-overlay.dts -o rk3588-rknpu-iommu-overlay.preprocessed.dts
+          dtc -@ -I dts -O dtb -o rk3588-rknpu-iommu.dtbo rk3588-rknpu-iommu-overlay.preprocessed.dts
 
       - name: Upload overlay artifact
         uses: actions/upload-artifact@v4
         with:
           name: rk3588-rknpu-dtbo
-          path: rk3588-rknpu.dtbo
+          path: |
+            rk3588-rknpu.dtbo
+            rk3588-rknpu-iommu.dtbo
 
   build-module:
     name: Cross-compile kernel module

@@ -1,0 +1,69 @@
+From: rknpu-rk3588 project <noreply@example.invalid>
+Subject: [PATCH] iommu: report the real IOMMU runtime PM state in rockchip_iommu_is_enabled()
+
+rknpu_power_off() polls rockchip_iommu_is_enabled() until the IOMMU is
+disabled before powering down the NPU1/NPU2 domains, because the IOMMU
+runtime suspend (rk_iommu_disable(), which touches the MMU registers of
+every core) runs asynchronously once the NPU, its PM device-link
+consumer, is suspended.
+
+The compat stub returned true whenever the device had an IOMMU group,
+i.e. always in IOMMU mode: every power-off then timed out ("iommu still
+enabled"), re-took the runtime PM reference and left the NPU powered.
+
+Resolve the "iommus" phandle to the IOMMU platform device and report
+whether it is still runtime-active (not RPM_SUSPENDED), which is what
+the vendor helper reports with its own enable state. No change in
+non-IOMMU mode: without an available IOMMU node it returns false, as
+before.
+
+Tested on Radxa ROCK 5B (RK3588), Armbian 7.3.4-edge-rockchip64.
+
+--- a/src/include/compat/soc/rockchip/rockchip_iommu.h
++++ b/src/include/compat/soc/rockchip/rockchip_iommu.h
+@@ -6,16 +6,38 @@
+ 
+ #include <linux/device.h>
+ #include <linux/iommu.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ 
++/*
++ * rknpu_power_off() polls this until the IOMMU is really disabled before
++ * powering down the NPU1/NPU2 domains: the IOMMU runtime suspend (supplier
++ * of the NPU through a PM device link) runs asynchronously and touches the
++ * MMU registers of every core. Report whether the IOMMU device referenced by
++ * "iommus" is still runtime-active (not RPM_SUSPENDED), like the vendor
++ * rockchip_iommu_is_enabled() does with its enable state.
++ */
+ static inline bool rockchip_iommu_is_enabled(struct device *dev)
+ {
+-	/* If the device has an IOMMU group, IOMMU is enabled */
+-	struct iommu_group *group = iommu_group_get(dev);
+-	if (group) {
+-		iommu_group_put(group);
+-		return true;
+-	}
+-	return false;
++	struct device_node *np;
++	struct platform_device *pdev;
++	bool active;
++
++	np = of_parse_phandle(dev->of_node, "iommus", 0);
++	if (!np)
++		return false;
++
++	pdev = of_find_device_by_node(np);
++	of_node_put(np);
++	if (!pdev)
++		return false;
++
++	active = !pm_runtime_status_suspended(&pdev->dev);
++	put_device(&pdev->dev);
++
++	return active;
+ }
+ 
+ static inline void rockchip_iommu_disable(struct device *dev)
