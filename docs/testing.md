@@ -166,6 +166,57 @@ Expected: ~3.7 ms/inference, ~271 inf/s, `load` in
 `/sys/kernel/debug/rknpu/load` showing Core0/1/2 all in the 70–80%
 range during the run.
 
+## Test 5 — IOMMU mode (optional)
+
+Requires `patches/0002`..`0005` (installed by `scripts/install-dkms.sh`)
+and the IOMMU overlay, either merged offline:
+
+```bash
+sudo IOMMU=1 ./scripts/apply-overlay.sh
+```
+
+or, on Armbian, applied by U-Boot at boot (the board DTB is left
+untouched, and U-Boot falls back to it if the overlay fails to apply):
+
+```bash
+K=/lib/modules/$(uname -r)/build
+cpp -nostdinc -I $K/include -undef -x assembler-with-cpp \
+    dts/rk3588-rknpu-iommu-overlay.dts -o /tmp/rknpu-iommu.pp.dts
+dtc -@ -I dts -O dtb -o /tmp/rknpu-iommu.dtbo /tmp/rknpu-iommu.pp.dts
+sudo install -D -m 0644 /tmp/rknpu-iommu.dtbo /boot/overlay-user/rknpu-iommu.dtbo
+# then add (or extend) in /boot/armbianEnv.txt:  user_overlays=rknpu-iommu
+```
+
+After reboot, `dmesg` must show:
+
+```
+RKNPU: npu1/npu2 power domains held on (iommu mode)
+RKNPU fdab0000.npu: RKNPU: rknpu iommu is enabled, using iommu mode
+```
+
+(three `error -EBUSY: can't request region` lines are expected: the IOMMU
+banks sit inside the NPU register windows and the driver falls back to
+`devm_ioremap()`, as on the BSP). Then:
+
+1. `sudo ./scripts/test-inference.sh` and `CORE_MASK=0_1_2` — same as Test 4.
+2. Large buffers, beyond CMA:
+   ```bash
+   gcc -O2 -Wall -o /tmp/rknpu_bigalloc tests/rknpu_bigalloc.c
+   sudo /tmp/rknpu_bigalloc 1536 1024 512       # non-contiguous, 3 GB
+   sudo /tmp/rknpu_bigalloc 256c 512c 1024c     # contiguous -> fallback
+   ```
+   Every line must end with `read-back ok`, then `PASS`, and `dmesg` must
+   not show any `WARNING` or `refcount_t` message.
+3. Soft reset during a 3-core inference loop:
+   `echo 1 | sudo tee /sys/kernel/debug/rknpu/reset` → `dmesg` shows
+   `iommu reprogrammed after soft reset`; the next inference run passes.
+4. `sudo rmmod rknpu && sudo modprobe rknpu`, then Test 4 again.
+
+**Without patch 0004, loading the module in IOMMU mode hard-locks the
+SoC.** If something goes wrong, stream `dmesg -W` (and ftrace
+`trace_pipe`) to another machine over SSH: the on-disk journal loses the
+last seconds before a lockup.
+
 ## Live monitoring
 
 For eyeballing what happens while a workload runs:
@@ -188,9 +239,10 @@ counters.
   devfreq governor relied on `rockchip_system_monitor` which isn't in
   mainline; our `simple_ondemand` fallback doesn't get the busy signal
   it expects. Performance measured above is the floor, not the ceiling.
-- **IOMMU is disabled.** Re-enabling it requires wiring a working IOMMU
-  node and is tracked as an open item. Current non-IOMMU mode works for
-  all tested workloads.
+- **IOMMU is disabled by default.** The default overlay runs in
+  non-IOMMU mode (all NPU memory from CMA). IOMMU mode is available with
+  `dts/rk3588-rknpu-iommu-overlay.dts` (Test 5), validated on RK3588 /
+  7.3.4 only.
 
 ## Results log
 
@@ -201,3 +253,7 @@ counters.
 | 2026-04-16 | 6.18.22-current-rockchip64 | Orange Pi 5 Pro (RK3588S) | Test 3 (smoke) | PASS | DRM_IOCTL_VERSION reports driver=rknpu 0.9.8, 3/3 IRQs bound |
 | 2026-04-16 | 6.18.22-current-rockchip64 | Orange Pi 5 Pro (RK3588S) | Test 4 single-core | PASS | MobileNet v1 @ 123.3 inf/s (8.11 ms) |
 | 2026-04-16 | 6.18.22-current-rockchip64 | Orange Pi 5 Pro (RK3588S) | Test 4 all-3-cores | PASS | MobileNet v1 @ 270.9 inf/s (3.69 ms); Core0 78%, Core1/2 73% |
+| 2026-11-25 | 7.3.4-edge-rockchip64 | Radxa ROCK 5B (RK3588) | Test 4 single-core (non-IOMMU) | PASS | MobileNet v1 @ 123 inf/s; Rocket nodes disabled instead of deleted |
+| 2026-11-25 | 7.3.4-edge-rockchip64 | Radxa ROCK 5B (RK3588) | Test 5 inference | PASS | IOMMU mode, SDK 2.5.0: 118–120 inf/s single-core, 264–275 inf/s 3 cores |
+| 2026-11-25 | 7.3.4-edge-rockchip64 | Radxa ROCK 5B (RK3588) | Test 5 large buffers | PASS | 3 GB non-contiguous; 1.75 GB contiguous via fallback; CMA 256 MB untouched |
+| 2026-11-25 | 7.3.4-edge-rockchip64 | Radxa ROCK 5B (RK3588) | Test 5 reset / rmmod / boot | PASS | IOMMU reprogrammed after soft reset; NPU domains off after rmmod; auto-load at boot |

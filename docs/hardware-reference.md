@@ -16,7 +16,7 @@ All values sourced from the Rockchip vendor kernel DTS (`rk3588s.dtsi` from rock
 | NPU GRF | `0xfd5a2000` - `0xfd5a20ff` | 256B | General Register File (syscon) |
 | NPU PVTM | `0xfdaf0000` - `0xfdaf00ff` | 256B | Process-Voltage-Temperature Monitor |
 
-**IOMMU note.** The current shipping overlay runs with `iommus` stripped from the combined node (non-IOMMU mode). The mainline Rocket DT exposes the IOMMUs as sibling nodes (`/iommu@fdab9000/fdaca000/fdada000`) which `scripts/apply-overlay.sh` deletes post-merge. Re-enabling the IOMMU is an open work item — addresses are recorded here for that future effort.
+**IOMMU note.** The default overlay runs with `iommus` stripped from the combined node (non-IOMMU mode); `scripts/apply-overlay.sh` deletes the Rocket IOMMU sibling nodes (`/iommu@fdab9000/fdaca000/fdada000`) post-merge. `dts/rk3588-rknpu-iommu-overlay.dts` instead extends `rknn_mmu_0` to the four banks above (one combined IOMMU, IRQs SPI 110/111/112 shared with the NPU, aclk/hclk of the three cores) and keeps `iommus = <&rknn_mmu_0>`. The core 1/2 banks are in the NPU1/NPU2 power domains while the IOMMU node only has NPUTOP: any access to them with NPU1/NPU2 off hangs the bus, hence `patches/0004` (see porting journal "IOMMU re-enabled").
 
 ## Interrupts
 

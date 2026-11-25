@@ -77,7 +77,7 @@ For clock/reset/power-domain constants:
 
 ## Known Issues and Risks
 
-1. **IOMMU v2 bug**: Mainline `rockchip-iommu.c` doesn't constrain page table allocations to DMA32 zone. If page tables land above 4GB, bus errors occur. Workaround: disable IOMMU in overlay. Test with IOMMU disabled first.
+1. **IOMMU**: the default overlay runs without IOMMU. IOMMU mode (`dts/rk3588-rknpu-iommu-overlay.dts` + `patches/0002`..`0005`) is validated on RK3588 / 7.3.4 only (porting journal "IOMMU re-enabled"); the inherited DMA32 page-table concern was not observed there (16 GB RAM). Loading the module with the IOMMU enabled but without `patches/0004` hard-locks the SoC (core 1/2 MMU banks accessed with NPU1/NPU2 powered off).
 
 2. **Phandle resolution**: If the board DTB lacks `__symbols__`, the overlay can't resolve `&cru` etc. May need hardcoded phandle values or DTB rebuild.
 
@@ -131,6 +131,6 @@ Conventional commits: `feat:`, `fix:`, `docs:`, `chore:`. Reference upstream sou
 - Do NOT add the full Linux kernel as a submodule (multi-GB)
 - Do NOT use GPL-2.0-or-later — must be GPL-2.0-only
 - Do NOT vendor Rockchip binary blobs — reference submodule paths
-- Do NOT assume IOMMU works on RK3588 — start disabled, test incrementally
+- Do NOT enable the IOMMU without `patches/0004` (bus lockup), and do NOT assume IOMMU mode works on a board/kernel not yet in `docs/testing.md` — validate non-IOMMU mode first
 - Do NOT expand scope into model conversion, LLM serving (rkllama), K8s device plugin wiring, or LXC/Incus container access. Those are downstream concerns that belong in sibling repos (the planned `gemma-rk3588` is the first). When the user asks for LLM work, the answer is "that goes in gemma-rk3588, not here." See [README.md#scope-and-related-repos](README.md#scope-and-related-repos).
 - Do NOT touch devfreq userspace writes (`governor`, `min_freq`, `max_freq`, `set_freq`) — observed to hang the board hard (physical power-cycle required). Passive reads are safe. See porting journal "Known issue: devfreq userspace governor hangs the board".
