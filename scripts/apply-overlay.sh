@@ -16,6 +16,11 @@
 #   4. fdtput -d  -> strip stale     (original rknn_core_0 referenced
 #      iommus phandle                 rknn_mmu_0 which we just deleted)
 #
+# With IOMMU=1, dts/rk3588-rknpu-iommu-overlay.dts is merged instead
+# (combined NPU IOMMU, requires patches/0002..0005). That overlay
+# disables the Rocket sibling nodes rather than deleting them and keeps
+# the iommus phandle, so steps 3 and 4 are skipped.
+#
 # The pristine board DTB is backed up to *.dtb.bak on first run so the
 # script is idempotent — rerunning it rebuilds from the pristine copy.
 #
@@ -24,7 +29,12 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OVERLAY_SRC="${REPO_ROOT}/dts/rk3588-rknpu-overlay.dts"
+IOMMU="${IOMMU:-0}"
+if [ "${IOMMU}" = "1" ]; then
+    OVERLAY_SRC="${REPO_ROOT}/dts/rk3588-rknpu-iommu-overlay.dts"
+else
+    OVERLAY_SRC="${REPO_ROOT}/dts/rk3588-rknpu-overlay.dts"
+fi
 KVER="$(uname -r)"
 KHEADERS="${KHEADERS:-/lib/modules/${KVER}/build}"
 DTB_TARGET="${DTB_TARGET:-/boot/dtb/rockchip/rk3588s-orangepi-5-pro.dtb}"
@@ -107,18 +117,22 @@ echo "Merging onto pristine DTB..."
 cp "${DTB_BAK}" "${WORK}/merged.dtb"
 fdtoverlay -i "${DTB_BAK}" -o "${WORK}/merged.dtb" "${WORK}/overlay.dtbo"
 
-echo "Removing mainline Rocket sibling nodes..."
-for node in "${SIBLINGS[@]}"; do
-    if fdtput -r "${WORK}/merged.dtb" "${node}" 2>/dev/null; then
-        echo "  removed ${node}"
-    else
-        echo "  (absent) ${node}"
-    fi
-done
+if [ "${IOMMU}" = "1" ]; then
+    echo "IOMMU mode: keeping the (disabled) Rocket nodes and the iommus phandle"
+else
+    echo "Removing mainline Rocket sibling nodes..."
+    for node in "${SIBLINGS[@]}"; do
+        if fdtput -r "${WORK}/merged.dtb" "${node}" 2>/dev/null; then
+            echo "  removed ${node}"
+        else
+            echo "  (absent) ${node}"
+        fi
+    done
 
-echo "Stripping stale ${STALE_PROP} phandle from ${COMBINED_NODE}..."
-fdtput -d "${WORK}/merged.dtb" "${COMBINED_NODE}" "${STALE_PROP}" 2>/dev/null \
-    || echo "  (already absent)"
+    echo "Stripping stale ${STALE_PROP} phandle from ${COMBINED_NODE}..."
+    fdtput -d "${WORK}/merged.dtb" "${COMBINED_NODE}" "${STALE_PROP}" 2>/dev/null \
+        || echo "  (already absent)"
+fi
 
 echo "Installing merged DTB..."
 install -m 0644 "${WORK}/merged.dtb" "${DTB_TARGET}"
